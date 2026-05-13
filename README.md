@@ -6,8 +6,10 @@ can stay focused on what it actually does.
 
 Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (pinned to `0.44.2`).
 
-**Status:** v0.1.0, pre-1.0, alpha. The three pure primitives below are shipped and
-tested. The high-level `NostrBot` runtime is on the next milestone, see [Roadmap](#roadmap).
+**Status:** v0.1.0 ships the three pure primitives below. v0.2.0 (the high-level
+`NostrBot` runtime) and v0.3.0 (`LnurlPayer`) are in active development; see
+[Roadmap](#roadmap). Items marked **(v0.2.0)** or **(v0.3.0)** below describe the
+target API and behavior, not what is callable from `pip install nostrbot-sdk` today.
 
 ## Why this exists
 
@@ -26,7 +28,11 @@ from nostrbot_sdk import NostrBot, NostrBotConfig, ValidatedZap, SenderContext
 cfg = NostrBotConfig(
     nsec="nsec1...",
     relays=["wss://relay.damus.io", "wss://nos.lol"],
-    profile={"name": "MyBot", "about": "an example bot", "lud16": "me@getalby.com"},
+    profile={
+        "name": "ButterBot",
+        "about": "an example bot",
+        "lud16": "butterbot@unsaltedbutter.ai",
+    },
     zap_provider_pubkey="<hex of your LNURL provider's nostr pubkey>",
 )
 
@@ -48,7 +54,9 @@ await bot.run()
 ## Features
 
 Each section below describes the problem the feature solves and how to use it. Items
-marked **(v0.1.0)** are shipped today; the rest are in active development.
+marked **(v0.1.0)** are shipped today. Items marked **(v0.2.0)** describe the target
+API of the next release, currently in development. Items marked **(v0.3.0)** are
+queued behind that.
 
 ### NIP-17 inbox detection with TTL cache (v0.1.0)
 
@@ -148,7 +156,7 @@ await client.send_event_builder(builder)
 short_tag = expiration_tag(seconds_from_now=3600)  # 1 hour
 ```
 
-### Client lifecycle and profile publishing (planned)
+### Client lifecycle and profile publishing (v0.2.0)
 
 `NostrBot` takes care of: parsing the nsec, building the signer/client, adding all
 your relays, connecting, then publishing your bot's kind 0 profile, NIP-65 relay
@@ -166,12 +174,12 @@ cfg = NostrBotConfig(
     nsec="nsec1...",
     relays=["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social"],
     profile={
-        "name": "MyBot",
+        "name": "Notible",
         "about": "I do a thing",
-        "picture": "https://example.com/avatar.png",
-        "lud16": "mybot@getalby.com",
-        "nip05": "mybot@example.com",
-        "website": "https://example.com",
+        "picture": "https://unsaltedbutter.ai/avatar.png",
+        "lud16": "notible@unsaltedbutter.ai",
+        "nip05": "notible@unsaltedbutter.ai",
+        "website": "https://unsaltedbutter.ai",
     },
     inbox_relay_count=2,  # advertise the first 2 relays as your NIP-17 inbox
 )
@@ -179,7 +187,7 @@ bot = NostrBot(cfg)
 await bot.start()
 ```
 
-### Subscription filters tuned for the gotchas (planned)
+### Subscription filters tuned for the gotchas (v0.2.0)
 
 `NostrBot` subscribes to three filters with the right shape:
 
@@ -191,7 +199,7 @@ in the past to defeat timing correlation. A naive `.since(now)` filter drops eve
 gift-wrapped DM. Both bots I built before this package shipped with this bug for at
 least a week. The library does it right out of the box.
 
-### Decryption, unwrap, and canonical sender identification (planned)
+### Decryption, unwrap, and canonical sender identification (v0.2.0)
 
 `NostrBot` decrypts NIP-04 events, unwraps NIP-17 gift wraps, and hands you a
 `SenderContext` with the sender's hex pubkey, npub, and last-seen protocol.
@@ -214,7 +222,7 @@ async def handle_dm(ctx: SenderContext, text: str) -> None:
     await ctx.reply("hi")       # uses protocol-matched send
 ```
 
-### Event deduplication (planned)
+### Event deduplication (v0.2.0)
 
 `NostrBot` skips any event whose id it has seen in the last 10 minutes (configurable).
 
@@ -224,7 +232,7 @@ two, three, sometimes five times per inbound message; if it has side effects (se
 a reply, charges a user, writes to a DB) you get duplicate side effects. The dedup
 dict is bounded and self-pruning.
 
-### Content deduplication (planned)
+### Content deduplication (v0.2.0)
 
 In addition to event-id dedup, `NostrBot` skips any `(sender_hex, content)` pair seen
 within a short window (default 30s).
@@ -235,7 +243,7 @@ arrive within milliseconds. Without content dedup, you process and reply to it t
 The window is short enough that a real retry from the user (after a failed reply,
 say) still gets through.
 
-### Per-user asyncio lock with idle cleanup (planned)
+### Per-user asyncio lock with idle cleanup (v0.2.0)
 
 Conversation state per sender is serialized behind an `asyncio.Lock` that lives in
 the bot. Idle locks are reaped after 5 minutes.
@@ -247,9 +255,12 @@ NIP-04 and NIP-17 delivery makes near-simultaneous DMs the common case, not the
 rare one. Cleanup matters because a long-running bot otherwise grows one lock per
 user it has ever spoken to.
 
-### Protocol-matched reply (planned)
+### Protocol-matched reply (v0.2.0)
 
-`ctx.reply(text)` sends back to the user using their preferred protocol.
+`ctx.reply(text)` sends back to the user using their preferred protocol. The
+underlying pattern already runs in both production bots in `unsaltedbutter.ai`; the
+v0.2.0 library work consolidates it into a single method on `SenderContext` so the
+~50 lines of `_send_dm` boilerplate go away in both call sites.
 
 **Why it matters.** If a user reaches you via NIP-04 (legacy clients still common),
 replying via NIP-17 means they cannot see your reply. If a user reaches you via
@@ -270,7 +281,7 @@ async def handle_dm(ctx: SenderContext, text: str) -> None:
 await bot.send_dm(some_pubkey_hex, "your widget is ready")
 ```
 
-### Persistent inbox relay pool (planned)
+### Persistent inbox relay pool (v0.2.0)
 
 When the bot sends a NIP-17 DM to a recipient whose inbox relays aren't in the pool,
 those relays are added permanently rather than connected ephemerally.
@@ -280,10 +291,12 @@ send, disconnect," leaves a TIME_WAIT TCP socket per send. A busy bot exhausts
 ephemeral ports within hours. Keeping the relays in the pool costs a few open
 sockets and avoids the problem entirely. We learned this the hard way.
 
-### System push channel (planned)
+### System push channel (v0.2.0)
 
 `@bot.on_push("backend")` routes inbound DMs from a known backend pubkey to a
-separate handler instead of the normal user-DM flow.
+separate handler instead of the normal user-DM flow. The pattern exists today in
+both production bots (an inline `if sender_hex == vps_bot_pubkey:` branch); v0.2.0
+turns it into a first-class concept with named routes.
 
 **Why it matters.** Many bots have a backend (web app, daemon) that pushes events to
 the bot over Nostr DMs: "user X paid invoice Y", "send the welcome message to npub Z".
@@ -309,7 +322,7 @@ async def handle_backend(payload: dict) -> None:
         await bot.send_dm(payload["user"], "thanks for paying!")
 ```
 
-### Identity resolver: kind 0 metadata cache (planned)
+### Identity resolver: kind 0 metadata cache (v0.2.0)
 
 `IdentityResolver` fetches and caches a sender's display name, lud16, picture, and
 nip05 from their kind 0 profile event.
@@ -329,7 +342,7 @@ async def handle_dm(ctx: SenderContext, text: str) -> None:
     await ctx.reply(f"hi {name}")
 ```
 
-### LNURL-pay outbound with NIP-57 zap requests (planned)
+### LNURL-pay outbound with NIP-57 zap requests (v0.3.0)
 
 `LnurlPayer` resolves a recipient's lud16 to LNURL-pay params, optionally builds a
 NIP-57 zap request, calls the callback to get a bolt11, and pays it through your
@@ -355,18 +368,18 @@ payer = LnurlPayer(
 )
 
 result = await payer.pay(
-    lud16="creator@getalby.com",
+    lud16="butterbot@unsaltedbutter.ai",
     amount_sats=500,
     zap_target_pubkey=creator_pubkey_hex,  # optional, makes it a NIP-57 zap
-    comment="from MyBot for content X",
-    source_url="https://example.com/content/x",
+    comment="from Notible for content X",
+    source_url="https://unsaltedbutter.ai/content/x",
 )
 
 if result.status == "completed":
     print(f"paid {result.actual_sats} sats, fee {result.fee_sats}")
 ```
 
-### Heartbeat callback (planned)
+### Heartbeat callback (v0.2.0)
 
 `@bot.on_heartbeat(interval=300)` registers an async callback that fires every N
 seconds with the bot's uptime in seconds.
@@ -376,7 +389,7 @@ here's my version, here's how long I've been up." The library handles the timing
 the shutdown coordination; you decide what to do with the data (POST to your
 monitoring API, log it, etc.).
 
-### Graceful shutdown (planned)
+### Graceful shutdown (v0.2.0)
 
 `await bot.run()` installs SIGINT and SIGTERM handlers, cancels background tasks
 cleanly, disconnects from relays, and returns.

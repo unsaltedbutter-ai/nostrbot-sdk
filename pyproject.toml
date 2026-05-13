@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "High-level toolkit for building Nostr bots: NIP-04/17 DMs, NIP-57 zaps, LNURL-pay"
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "Unsalted Butter", email = "noreply@unsaltedbutter.ai" }]
+authors = [{ name = "Unsalted Butter", email = "info@unsaltedbutter.ai" }]
 requires-python = ">=3.11"
 keywords = ["nostr", "bot", "nip-17", "nip-57", "zap", "lightning"]
 classifiers = [
