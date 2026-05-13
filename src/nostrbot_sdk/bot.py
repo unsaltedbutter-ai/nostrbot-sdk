@@ -69,6 +69,7 @@ from nostrbot_sdk.expiration import expiration_tag
 from nostrbot_sdk.identity import IdentityResolver
 from nostrbot_sdk.locks import UserLockManager
 from nostrbot_sdk.nip17_support import Nip17Support
+from nostrbot_sdk.publishing import PublishResult, send_article, send_note
 from nostrbot_sdk.zap_verify import ValidatedZap, validate_zap_receipt
 
 log = logging.getLogger(__name__)
@@ -324,6 +325,25 @@ class NostrBot:
             exp_tag,
         ])
         await self._client.send_event_builder(builder)
+
+    # -- Publishing (kind 1 notes and kind 30023 long-form articles) ---------
+
+    async def post_note(self, content: str, **kw) -> PublishResult:
+        """Publish a kind 1 note. See nostrbot_sdk.publishing.send_note for kwargs.
+
+        Reuses the bot's connected client (no per-call connect/disconnect).
+        Common kwargs: reply_to, reply_root, quote, quote_author,
+        mention_pubkeys, hashtags, expiration_seconds, extra_tags.
+        """
+        return await send_note(self._client, content, **kw)
+
+    async def post_article(self, title: str, content: str, **kw) -> PublishResult:
+        """Publish a NIP-23 long-form article (kind 30023).
+
+        Required kwarg: identifier (the `d`-tag value).
+        Optional: summary, image, hashtags, published_at, extra_tags.
+        """
+        return await send_article(self._client, title, content, **kw)
 
     # -- Lifecycle -------------------------------------------------------------
 

@@ -3,8 +3,16 @@
 Public API:
 
   Bot runtime:
-    - NostrBot, NostrBotConfig: client lifecycle, dispatch, send_dm
+    - NostrBot, NostrBotConfig: client lifecycle, dispatch, send_dm,
+      post_note, post_article
     - SenderContext: per-message handle passed to user callbacks
+
+  Publishing:
+    - Publisher: one-shot publisher for cron / CLI scripts
+    - PublishResult: outcome of a publish (event_id, note_id, success_relays,
+      failed_relays, kind, .ok)
+    - send_note, send_article: lower-level helpers (take a Client directly)
+    - build_note_tags, build_article_tags, normalize_hashtag: tag builders
 
   Caches:
     - IdentityResolver, Identity: kind 0 metadata cache
@@ -32,10 +40,18 @@ from nostrbot_sdk.expiration import expiration_tag
 from nostrbot_sdk.identity import Identity, IdentityResolver
 from nostrbot_sdk.locks import UserLockManager
 from nostrbot_sdk.nip17_support import Nip17Support
+from nostrbot_sdk.publishing import (
+    PublishResult,
+    Publisher,
+    build_article_tags,
+    build_note_tags,
+    normalize_hashtag,
+    send_article,
+    send_note,
+)
 from nostrbot_sdk.zap_verify import ValidatedZap, validate_zap_receipt
 
-# LNURL-pay symbols are imported lazily to keep httpx optional: anything that
-# doesn't import the symbols directly works without the [lnurl] extra installed.
+# LNURL-pay symbols are imported lazily to keep httpx optional.
 try:
     from nostrbot_sdk.lnurl_pay import (
         DEFAULT_FEE_POLICY,
@@ -48,7 +64,6 @@ try:
         PayoutResult,
     )
 except ImportError:
-    # httpx not installed: LnurlPayer etc. unavailable.
     pass
 
 __all__ = [
@@ -66,11 +81,18 @@ __all__ = [
     "NostrBot",
     "NostrBotConfig",
     "PayoutResult",
+    "PublishResult",
+    "Publisher",
     "SenderContext",
     "UserLockManager",
     "ValidatedZap",
+    "build_article_tags",
+    "build_note_tags",
     "expiration_tag",
+    "normalize_hashtag",
+    "send_article",
+    "send_note",
     "validate_zap_receipt",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

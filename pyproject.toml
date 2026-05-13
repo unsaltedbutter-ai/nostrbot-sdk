@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nostrbot-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "High-level toolkit for building Nostr bots: NIP-04/17 DMs, NIP-57 zaps, LNURL-pay"
 readme = "README.md"
 license = { text = "MIT" }
