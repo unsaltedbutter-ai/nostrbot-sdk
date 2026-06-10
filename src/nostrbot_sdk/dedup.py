@@ -26,9 +26,10 @@ class Dedup(Generic[K]):
     Thread-unsafe but coroutine-safe in CPython (dict ops are atomic and we
     tolerate benign races on write).
 
-    Pruning is amortized: every `prune_every` calls to check_and_add we walk
-    the dict and drop stale entries. Avoids O(n) on every event while still
-    bounding memory for long-running bots.
+    Expiry is enforced on every lookup: an entry older than the TTL is
+    treated as absent even if it hasn't been pruned yet. Pruning (every
+    `prune_every` calls to check_and_add) only bounds memory for
+    long-running bots; it is not a correctness mechanism.
     """
 
     def __init__(self, ttl_seconds: float, prune_every: int = 50) -> None:
@@ -48,7 +49,8 @@ class Dedup(Generic[K]):
         if self._call_count >= self._prune_every:
             self._call_count = 0
             self._prune(now)
-        if key in self._seen:
+        ts = self._seen.get(key)
+        if ts is not None and now - ts < self._ttl:
             return True
         self._seen[key] = now
         return False
@@ -72,4 +74,5 @@ class Dedup(Generic[K]):
         return len(self._seen)
 
     def __contains__(self, key: K) -> bool:
-        return key in self._seen
+        ts = self._seen.get(key)
+        return ts is not None and time.monotonic() - ts < self._ttl

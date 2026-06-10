@@ -10,12 +10,14 @@ used.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from nostr_sdk import Keys, PublicKey
 
-from nostrbot_sdk.bot import NostrBot, NostrBotConfig
+from nostrbot_sdk.bot import NostrBot, NostrBotConfig, _NotifyBridge
+from nostrbot_sdk.zap_verify import ValidatedZap
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -47,6 +49,8 @@ def _stub_client_methods(bot: NostrBot) -> None:
     bot._client.add_relay = AsyncMock(return_value=False)
     bot._client.connect = AsyncMock()
     bot._signer.nip04_encrypt = AsyncMock(return_value="<ciphertext>")
+    # Default: recipient has no kind 10050 (tests override per-case).
+    bot._nip17_support.check = AsyncMock(return_value=None)
 
 
 @pytest.fixture
@@ -214,16 +218,33 @@ def test_on_heartbeat_rejects_nonpositive_interval() -> None:
 # -- send_dm: protocol matching -----------------------------------------------
 
 
-async def test_send_dm_known_nip17_sends_private_msg(bot, other_pk_hex) -> None:
-    bot._user_protocol[other_pk_hex] = "nip17"
-    await bot.send_dm(other_pk_hex, "hello")
+async def test_send_dm_known_nip17_delivers_to_inbox_relays(bot, other_pk_hex) -> None:
+    """NIP-17 repliers get their kind 10050 inbox relays looked up: without
+    gossip, send_private_msg would only publish to OUR pool."""
+    bot._set_user_protocol(other_pk_hex, "nip17")
+    bot._nip17_support.check = AsyncMock(return_value=["wss://inbox.example/"])
+    bot._client.add_relay = AsyncMock(return_value=True)
+    ok = await bot.send_dm(other_pk_hex, "hello")
+    assert ok is True
+    bot._nip17_support.check.assert_awaited_once_with(other_pk_hex)
+    bot._client.send_private_msg_to.assert_awaited_once()
+    bot._client.send_event_builder.assert_not_awaited()
+
+
+async def test_send_dm_known_nip17_no_10050_broadcasts_own_pool(bot, other_pk_hex) -> None:
+    """A NIP-17 replier with no findable 10050 still gets a NIP-17 reply
+    (best-effort to our pool), never a metadata-leaking NIP-04 downgrade."""
+    bot._set_user_protocol(other_pk_hex, "nip17")
+    ok = await bot.send_dm(other_pk_hex, "hello")
+    assert ok is True
     bot._client.send_private_msg.assert_awaited_once()
     bot._client.send_event_builder.assert_not_awaited()
 
 
 async def test_send_dm_known_nip04_sends_kind_4_event(bot, other_pk_hex) -> None:
-    bot._user_protocol[other_pk_hex] = "nip04"
-    await bot.send_dm(other_pk_hex, "hello")
+    bot._set_user_protocol(other_pk_hex, "nip04")
+    ok = await bot.send_dm(other_pk_hex, "hello")
+    assert ok is True
     bot._client.send_event_builder.assert_awaited_once()
     bot._client.send_private_msg.assert_not_awaited()
     bot._signer.nip04_encrypt.assert_awaited_once()
@@ -245,12 +266,36 @@ async def test_send_dm_unknown_protocol_falls_back_to_nip04(bot, other_pk_hex) -
     bot._client.send_private_msg_to.assert_not_awaited()
 
 
-async def test_send_dm_swallows_exceptions(bot, other_pk_hex) -> None:
-    """A failing send_dm must not propagate; it just logs."""
-    bot._user_protocol[other_pk_hex] = "nip17"
+async def test_send_dm_swallows_exceptions_and_returns_false(bot, other_pk_hex) -> None:
+    """A failing send_dm must not propagate; it logs and returns False."""
+    bot._set_user_protocol(other_pk_hex, "nip17")
     bot._client.send_private_msg = AsyncMock(side_effect=RuntimeError("relay error"))
-    # Should not raise
-    await bot.send_dm(other_pk_hex, "hi")
+    ok = await bot.send_dm(other_pk_hex, "hi")
+    assert ok is False
+
+
+async def test_send_dm_expired_protocol_hint_is_ignored(bot, other_pk_hex) -> None:
+    """A protocol hint older than user_protocol_ttl_seconds is dropped and
+    send_dm falls back to the kind 10050 lookup."""
+    bot._user_protocol[other_pk_hex] = (
+        "nip04",
+        time.monotonic() - bot._config.user_protocol_ttl_seconds - 1,
+    )
+    await bot.send_dm(other_pk_hex, "hi")  # 10050 check stubbed to None
+    bot._nip17_support.check.assert_awaited_once_with(other_pk_hex)
+    assert other_pk_hex not in bot._user_protocol
+
+
+def test_prune_user_protocol_removes_stale_entries(bot, other_pk_hex) -> None:
+    bot._set_user_protocol(other_pk_hex, "nip17")
+    bot._user_protocol["ee" * 32] = (
+        "nip04",
+        time.monotonic() - bot._config.user_protocol_ttl_seconds - 1,
+    )
+    removed = bot._prune_user_protocol()
+    assert removed == 1
+    assert other_pk_hex in bot._user_protocol
+    assert "ee" * 32 not in bot._user_protocol
 
 
 # -- _route_inbound: DM path --------------------------------------------------
@@ -275,7 +320,7 @@ async def test_route_inbound_updates_user_protocol(bot, other_pk_hex) -> None:
 
     sender_pk = PublicKey.parse(other_pk_hex)
     await bot._route_inbound(sender_pk, other_pk_hex, "hi", "nip17")
-    assert bot._user_protocol[other_pk_hex] == "nip17"
+    assert bot._get_user_protocol(other_pk_hex) == "nip17"
 
 
 async def test_route_inbound_skips_duplicate_content(bot, other_pk_hex) -> None:
@@ -368,6 +413,115 @@ async def test_route_inbound_push_handler_exception_logged_not_propagated(
 
     sender_pk = PublicKey.parse(other_pk_hex)
     await bot._route_inbound(sender_pk, other_pk_hex, "anything", "nip17")  # no raise
+
+
+async def test_route_inbound_push_dedups_dual_protocol_delivery(other_pk_hex) -> None:
+    """A backend sending the same push via NIP-04 and NIP-17 (compat) must
+    only trigger the push handler once."""
+    cfg = _mk_config(accept_pushes_from={other_pk_hex: "vps"})
+    bot = NostrBot(cfg)
+    _stub_client_methods(bot)
+
+    pushed: list[str] = []
+
+    @bot.on_push("vps")
+    async def push_h(content):
+        pushed.append(content)
+
+    sender_pk = PublicKey.parse(other_pk_hex)
+    await bot._route_inbound(sender_pk, other_pk_hex, '{"type":"x"}', "nip04")
+    await bot._route_inbound(sender_pk, other_pk_hex, '{"type":"x"}', "nip17")
+    assert pushed == ['{"type":"x"}']
+
+
+async def test_route_inbound_push_failure_clears_content_dedup(other_pk_hex) -> None:
+    cfg = _mk_config(accept_pushes_from={other_pk_hex: "vps"})
+    bot = NostrBot(cfg)
+    _stub_client_methods(bot)
+
+    @bot.on_push("vps")
+    async def push_h(content):
+        raise RuntimeError("boom")
+
+    sender_pk = PublicKey.parse(other_pk_hex)
+    await bot._route_inbound(sender_pk, other_pk_hex, "payload", "nip17")
+    assert (other_pk_hex, "payload") not in bot._dedup_content
+
+
+# -- zap receipt replay protection ----------------------------------------------
+
+
+async def test_zap_receipt_replay_is_ignored(other_pk_hex) -> None:
+    """The same validated kind 9735 redelivered later (e.g., by a malicious
+    relay after the short event dedup expires) must not re-trigger on_zap."""
+    bot = NostrBot(_mk_config(zap_provider_pubkey="aa" * 32))
+    _stub_client_methods(bot)
+
+    credited: list[str] = []
+
+    @bot.on_zap
+    async def zap_h(zap, ctx):
+        credited.append(zap.event_id)
+
+    zap = ValidatedZap(
+        event_id="cc" * 32,
+        sender_hex=other_pk_hex,
+        amount_sats=21,
+        bolt11="lnbc210n1fake",
+    )
+    event = MagicMock()
+    with patch("nostrbot_sdk.bot.validate_zap_receipt", return_value=zap):
+        await bot._handle_zap_receipt(event)
+        await bot._handle_zap_receipt(event)
+
+    assert credited == ["cc" * 32]
+
+
+# -- _NotifyBridge: in-flight task tracking --------------------------------------
+
+
+async def test_notify_bridge_tracks_inflight_tasks(bot) -> None:
+    """Handler tasks must be strongly referenced (asyncio only keeps weak
+    refs) and discarded from the set once done."""
+    bridge = _NotifyBridge(bot)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_handler(event):
+        started.set()
+        await release.wait()
+
+    bot._handle_event = slow_handler  # type: ignore[assignment]
+    await bridge.handle(MagicMock(), "sub", MagicMock())
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert len(bot._inflight) == 1
+
+    release.set()
+    task = next(iter(bot._inflight))
+    await task
+    await asyncio.sleep(0)  # let the done-callback run
+    assert len(bot._inflight) == 0
+
+
+async def test_stop_waits_for_inflight_handlers(bot) -> None:
+    """stop() drains in-flight handler tasks before disconnecting."""
+    bot._started = True
+    bot._client.disconnect = AsyncMock()
+
+    finished: list[str] = []
+
+    async def handler() -> None:
+        await asyncio.sleep(0.05)
+        finished.append("done")
+
+    task = asyncio.create_task(handler())
+    bot._inflight.add(task)
+    task.add_done_callback(bot._inflight.discard)
+
+    await bot.stop()
+    assert finished == ["done"]
+    bot._client.disconnect.assert_awaited_once()
 
 
 # -- _handle_event: dedup ------------------------------------------------------

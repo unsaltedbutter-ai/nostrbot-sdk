@@ -99,6 +99,7 @@ def build_note_tags(
     *,
     reply_to: str | None = None,
     reply_root: str | None = None,
+    reply_to_author: str | None = None,
     quote: str | None = None,
     quote_author: str | None = None,
     mention_pubkeys: list[str] | None = None,
@@ -112,6 +113,9 @@ def build_note_tags(
       - `reply_to` is the immediate parent event id (hex).
       - `reply_root` is the thread root. Omit if `reply_to` IS the root
         (direct reply to top-level post).
+      - `reply_to_author` is the parent author's pubkey (hex). Highly
+        recommended: NIP-10 expects replies to `p`-tag the people being
+        replied to; without it the parent author gets no notification.
       - Emits marked `e`-tags: "root" for the root, "reply" for the parent
         (only when they differ).
 
@@ -121,7 +125,8 @@ def build_note_tags(
         adds a `p`-tag so the quoted author sees it in their notifications.
 
     Other:
-      - `mention_pubkeys`: additional `p`-tags (deduped against quote_author).
+      - `mention_pubkeys`: additional `p`-tags (deduped against
+        reply_to_author / quote_author).
       - `hashtags`: emitted as lowercased `t`-tags.
       - `expiration_seconds`: NIP-40 expiration in seconds from now.
       - `extra_tags`: any custom tags appended verbatim at the end.
@@ -135,13 +140,17 @@ def build_note_tags(
         tags.append(Tag.parse(["e", root, "", "root"]))
         if reply_root and reply_root != reply_to:
             tags.append(Tag.parse(["e", reply_to, "", "reply"]))
+        if reply_to_author:
+            tags.append(Tag.public_key(PublicKey.parse(reply_to_author)))
+            p_tags_seen.add(reply_to_author)
 
     # NIP-18 quote.
     if quote:
         if quote_author:
             tags.append(Tag.parse(["q", quote, "", quote_author]))
-            tags.append(Tag.public_key(PublicKey.parse(quote_author)))
-            p_tags_seen.add(quote_author)
+            if quote_author not in p_tags_seen:
+                tags.append(Tag.public_key(PublicKey.parse(quote_author)))
+                p_tags_seen.add(quote_author)
         else:
             tags.append(Tag.parse(["q", quote]))
 
@@ -222,6 +231,7 @@ async def send_note(
     *,
     reply_to: str | None = None,
     reply_root: str | None = None,
+    reply_to_author: str | None = None,
     quote: str | None = None,
     quote_author: str | None = None,
     mention_pubkeys: list[str] | None = None,
@@ -233,6 +243,7 @@ async def send_note(
     tags = build_note_tags(
         reply_to=reply_to,
         reply_root=reply_root,
+        reply_to_author=reply_to_author,
         quote=quote,
         quote_author=quote_author,
         mention_pubkeys=mention_pubkeys,

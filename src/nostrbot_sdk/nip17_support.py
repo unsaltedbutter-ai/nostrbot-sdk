@@ -87,7 +87,19 @@ class Nip17Support:
             return entry.relay_urls
 
         # Cache miss or expired: query relays
-        relay_urls = await self._fetch_dm_relays(pubkey_hex)
+        try:
+            relay_urls = await self._fetch_dm_relays(pubkey_hex)
+        except Exception:
+            # Transient failure (timeout, relay down): do NOT cache this as
+            # "no NIP-17 support" — that would downgrade a NIP-17 user to
+            # metadata-leaking NIP-04 for a full TTL. Serve the stale entry
+            # if we have one, else report no support for this call only.
+            log.debug(
+                "Failed to fetch kind 10050 for %s; not caching",
+                pubkey_hex[:16],
+                exc_info=True,
+            )
+            return entry.relay_urls if entry is not None else None
 
         # Cache the result (even if None, to avoid repeated lookups)
         self._cache[pubkey_hex] = _CacheEntry(
@@ -109,41 +121,33 @@ class Nip17Support:
         """Query connected relays for the recipient's kind 10050 event.
 
         Returns a list of relay URLs from the event's "relay" tags,
-        or None if no kind 10050 event is found.
+        or None if no kind 10050 event is found. Raises on fetch errors so
+        the caller can distinguish "no 10050" from "lookup failed".
         """
-        try:
-            pk = PublicKey.parse(pubkey_hex)
-            f = Filter().kind(KIND_DM_RELAYS).author(pk).limit(1)
-            events = await self._client.fetch_events(f, FETCH_TIMEOUT)
+        pk = PublicKey.parse(pubkey_hex)
+        f = Filter().kind(KIND_DM_RELAYS).author(pk).limit(1)
+        events = await self._client.fetch_events(f, FETCH_TIMEOUT)
 
-            if events.is_empty():
-                return None
+        if events.is_empty():
+            return None
 
-            event = events.first()
-            relay_urls: list[str] = []
-            for tag in event.tags().to_vec():
-                tag_vec = tag.as_vec()
-                if len(tag_vec) >= 2 and tag_vec[0] == "relay":
-                    url = tag_vec[1].strip()
-                    if url:
-                        relay_urls.append(url)
+        event = events.first()
+        relay_urls: list[str] = []
+        for tag in event.tags().to_vec():
+            tag_vec = tag.as_vec()
+            if len(tag_vec) >= 2 and tag_vec[0] == "relay":
+                url = tag_vec[1].strip()
+                if url:
+                    relay_urls.append(url)
 
-            if not relay_urls:
-                # Kind 10050 exists but has no relay tags: treat as unsupported
-                log.debug(
-                    "Kind 10050 for %s has no relay tags", pubkey_hex[:16],
-                )
-                return None
-
-            return relay_urls
-
-        except Exception:
+        if not relay_urls:
+            # Kind 10050 exists but has no relay tags: treat as unsupported
             log.debug(
-                "Failed to fetch kind 10050 for %s, falling back to NIP-04",
-                pubkey_hex[:16],
-                exc_info=True,
+                "Kind 10050 for %s has no relay tags", pubkey_hex[:16],
             )
             return None
+
+        return relay_urls
 
     def invalidate(self, pubkey_hex: str) -> None:
         """Remove a cached entry (e.g., when a user changes their relay list)."""

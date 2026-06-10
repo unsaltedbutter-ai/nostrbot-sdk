@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from bolt11 import Bolt11, MilliSatoshi, Tags
+from bolt11 import encode as bolt11_encode
 from nostr_sdk import Keys
 
 from nostrbot_sdk.lnurl_pay import (
@@ -15,11 +19,40 @@ from nostrbot_sdk.lnurl_pay import (
     FeePolicy,
     LnurlPayParams,
     LnurlPayer,
+    LnurlSecurityError,
+    PaymentOutcomeUnknown,
     PayoutResult,
     create_zap_request,
     request_invoice,
     resolve_lud16,
 )
+
+# Throwaway node key for minting test invoices (not a real wallet).
+_NODE_KEY = "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734"
+
+
+def _mint_invoice(
+    amount_msats: int | None = 1000,
+    *,
+    description: str | None = "test",
+    description_hash: str | None = None,
+) -> str:
+    """Mint a real, signed bolt11 invoice for verification tests."""
+    tag_dict: dict = {
+        "payment_hash": "00" * 32,
+        "payment_secret": "11" * 32,
+    }
+    if description_hash is not None:
+        tag_dict["description_hash"] = description_hash
+    else:
+        tag_dict["description"] = description
+    invoice = Bolt11(
+        currency="bc",
+        date=1700000000,
+        tags=Tags.from_dict(tag_dict),
+        amount_msat=MilliSatoshi(amount_msats) if amount_msats else None,
+    )
+    return bolt11_encode(invoice, _NODE_KEY)
 
 
 # -- FeePolicy.tiers (port of creator_payout test suite) ----------------------
@@ -227,21 +260,27 @@ def _params(callback: str = "https://x.com/cb", **kw) -> LnurlPayParams:
 
 
 async def test_request_invoice_plain() -> None:
-    ctx, client = _mock_async_client(_httpx_response({"pr": "lnbc1..."}))
+    pr = _mint_invoice(amount_msats=1000)
+    ctx, client = _mock_async_client(_httpx_response({"pr": pr}))
     with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
         bolt11, is_zap = await request_invoice(_params(), amount_msats=1000)
-    assert bolt11 == "lnbc1..."
+    assert bolt11 == pr
     assert is_zap is False
     url = client.get.call_args[0][0]
     assert "amount=1000" in url
 
 
 async def test_request_invoice_with_zap_request() -> None:
-    ctx, client = _mock_async_client(_httpx_response({"pr": "lnbc1..."}))
+    zap_json = '{"kind":9734}'
+    pr = _mint_invoice(
+        amount_msats=1000,
+        description_hash=hashlib.sha256(zap_json.encode()).hexdigest(),
+    )
+    ctx, client = _mock_async_client(_httpx_response({"pr": pr}))
     with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
         bolt11, is_zap = await request_invoice(
             _params(), amount_msats=1000,
-            zap_request_json='{"kind":9734}',
+            zap_request_json=zap_json,
         )
     assert is_zap is True
     url = client.get.call_args[0][0]
@@ -250,7 +289,7 @@ async def test_request_invoice_with_zap_request() -> None:
 
 
 async def test_request_invoice_with_comment_when_allowed() -> None:
-    ctx, client = _mock_async_client(_httpx_response({"pr": "lnbc1..."}))
+    ctx, client = _mock_async_client(_httpx_response({"pr": _mint_invoice()}))
     with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
         await request_invoice(
             _params(comment_allowed=100), amount_msats=1000, comment="hello world",
@@ -260,7 +299,7 @@ async def test_request_invoice_with_comment_when_allowed() -> None:
 
 
 async def test_request_invoice_truncates_comment_to_limit() -> None:
-    ctx, client = _mock_async_client(_httpx_response({"pr": "lnbc1..."}))
+    ctx, client = _mock_async_client(_httpx_response({"pr": _mint_invoice()}))
     long_comment = "a" * 500
     with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
         await request_invoice(
@@ -271,13 +310,52 @@ async def test_request_invoice_truncates_comment_to_limit() -> None:
 
 
 async def test_request_invoice_skips_comment_when_not_allowed() -> None:
-    ctx, client = _mock_async_client(_httpx_response({"pr": "lnbc1..."}))
+    ctx, client = _mock_async_client(_httpx_response({"pr": _mint_invoice()}))
     with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
         await request_invoice(
             _params(comment_allowed=0), amount_msats=1000, comment="hi",
         )
     url = client.get.call_args[0][0]
     assert "comment=" not in url
+
+
+async def test_request_invoice_rejects_wrong_amount() -> None:
+    """LUD-06: a server returning an invoice for a different amount than
+    requested must not be paid."""
+    pr = _mint_invoice(amount_msats=500_000_000)  # 500k sats, not the 1 sat asked
+    ctx, _ = _mock_async_client(_httpx_response({"pr": pr}))
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(LnurlSecurityError, match="refusing to pay"):
+            await request_invoice(_params(), amount_msats=1000)
+
+
+async def test_request_invoice_rejects_amountless_invoice() -> None:
+    pr = _mint_invoice(amount_msats=None)
+    ctx, _ = _mock_async_client(_httpx_response({"pr": pr}))
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(LnurlSecurityError):
+            await request_invoice(_params(), amount_msats=1000)
+
+
+async def test_request_invoice_rejects_undecodable_invoice() -> None:
+    ctx, _ = _mock_async_client(_httpx_response({"pr": "lnbc1notarealinvoice"}))
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(LnurlSecurityError, match="undecodable"):
+            await request_invoice(_params(), amount_msats=1000)
+
+
+async def test_request_invoice_zap_without_commitment_downgrades_is_zap() -> None:
+    """If the invoice doesn't commit to the zap request via description_hash,
+    the payment proceeds but is reported as a plain LNURL payment."""
+    pr = _mint_invoice(amount_msats=1000, description="not the zap request")
+    ctx, _ = _mock_async_client(_httpx_response({"pr": pr}))
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        bolt11, is_zap = await request_invoice(
+            _params(), amount_msats=1000,
+            zap_request_json='{"kind":9734}',
+        )
+    assert bolt11 == pr
+    assert is_zap is False
 
 
 async def test_request_invoice_rejects_error_response() -> None:
@@ -345,6 +423,67 @@ async def test_btcpay_wallet_omits_max_fee_percent_when_none() -> None:
 def test_btcpay_wallet_strips_trailing_slash_from_url() -> None:
     wallet = BtcPayWallet("https://btcpay.example.com/", "s", "k")
     assert wallet._url == "https://btcpay.example.com"
+
+
+async def test_btcpay_wallet_timeout_raises_outcome_unknown() -> None:
+    """A timed-out pay request may still settle; it must NOT look like a
+    definitive failure (that would trigger a double-paying retry)."""
+    ctx, client = _mock_async_client(_httpx_response({}))
+    client.post = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(PaymentOutcomeUnknown):
+            await wallet.pay("lnbc1...")
+
+
+async def test_btcpay_wallet_connect_error_is_definitive_failure() -> None:
+    """If the request never reached BTCPay, nothing was paid: a plain error
+    (retryable) is correct, not PaymentOutcomeUnknown."""
+    ctx, client = _mock_async_client(_httpx_response({}))
+    client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(httpx.ConnectError):
+            await wallet.pay("lnbc1...")
+
+
+async def test_btcpay_wallet_5xx_raises_outcome_unknown() -> None:
+    resp = _httpx_response({}, status=502)
+    ctx, _ = _mock_async_client(resp)
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(PaymentOutcomeUnknown):
+            await wallet.pay("lnbc1...")
+
+
+async def test_btcpay_wallet_pending_status_raises_outcome_unknown() -> None:
+    ctx, _ = _mock_async_client(_httpx_response({
+        "status": "Pending", "totalAmount": 0, "feeAmount": 0,
+    }))
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(PaymentOutcomeUnknown):
+            await wallet.pay("lnbc1...")
+
+
+async def test_btcpay_wallet_failed_status_raises_value_error() -> None:
+    ctx, _ = _mock_async_client(_httpx_response({
+        "status": "Failed", "totalAmount": 0, "feeAmount": 0,
+    }))
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        with pytest.raises(ValueError, match="failed"):
+            await wallet.pay("lnbc1...")
+
+
+async def test_btcpay_wallet_complete_status_succeeds() -> None:
+    ctx, _ = _mock_async_client(_httpx_response({
+        "status": "Complete", "totalAmount": 1003000, "feeAmount": 3000,
+    }))
+    wallet = BtcPayWallet("https://btcpay.example.com", "s", "k")
+    with patch("nostrbot_sdk.lnurl_pay.httpx.AsyncClient", return_value=ctx):
+        total, fee = await wallet.pay("lnbc1...")
+    assert (total, fee) == (1003, 3)
 
 
 # -- LnurlPayer end-to-end ----------------------------------------------------
@@ -487,6 +626,54 @@ async def test_payer_pay_raises_when_all_tiers_fail() -> None:
     ):
         with pytest.raises(RuntimeError, match="failed at all fee tiers"):
             await payer.pay(lud16="alice@unsaltedbutter.ai", amount_sats=500)
+
+
+async def test_payer_pay_unknown_outcome_aborts_tier_retries() -> None:
+    """PaymentOutcomeUnknown must propagate after ONE wallet call: requesting
+    and paying a second invoice could double-pay the same payout."""
+
+    class _UnknownWallet:
+        def __init__(self):
+            self.calls = 0
+
+        async def pay(self, bolt11, max_fee_percent=None):
+            self.calls += 1
+            raise PaymentOutcomeUnknown("timed out")
+
+    wallet = _UnknownWallet()
+    payer = LnurlPayer(keys=Keys.generate(), wallet=wallet)
+    with (
+        patch(
+            "nostrbot_sdk.lnurl_pay.resolve_lud16",
+            new=AsyncMock(return_value=_params()),
+        ),
+        patch(
+            "nostrbot_sdk.lnurl_pay.request_invoice",
+            new=AsyncMock(return_value=("lnbc500n1fake", False)),
+        ),
+    ):
+        with pytest.raises(PaymentOutcomeUnknown):
+            await payer.pay(lud16="alice@unsaltedbutter.ai", amount_sats=500)
+    assert wallet.calls == 1
+
+
+async def test_payer_pay_security_error_aborts_tier_retries() -> None:
+    """A wrong-amount invoice means a hostile/broken server; no other tier
+    should be attempted."""
+    wallet = _FakeWallet()
+    payer = LnurlPayer(keys=Keys.generate(), wallet=wallet)
+    mock_request = AsyncMock(side_effect=LnurlSecurityError("wrong amount"))
+    with (
+        patch(
+            "nostrbot_sdk.lnurl_pay.resolve_lud16",
+            new=AsyncMock(return_value=_params()),
+        ),
+        patch("nostrbot_sdk.lnurl_pay.request_invoice", new=mock_request),
+    ):
+        with pytest.raises(LnurlSecurityError):
+            await payer.pay(lud16="alice@unsaltedbutter.ai", amount_sats=500)
+    assert mock_request.await_count == 1
+    assert wallet.calls == []
 
 
 async def test_payer_pay_without_keys_falls_back_when_zap_target_set() -> None:

@@ -293,3 +293,38 @@ class TestNip17SupportCleanup:
         removed = detector.cleanup_expired()
         assert removed == 0
         assert len(detector._cache) == 1
+
+
+# -- Tests: fetch errors are not cached -----------------------------------------
+
+
+class TestFetchErrorCaching:
+    async def test_fetch_error_not_cached_retries_next_call(self) -> None:
+        """A transient fetch failure must not negative-cache the user as
+        NIP-04-only for a full TTL."""
+        client = AsyncMock()
+        client.fetch_events.side_effect = RuntimeError("relay down")
+        detector = Nip17Support(client)
+
+        assert await detector.check(PUBKEY_HEX) is None
+
+        # Relay recovers; the next check must hit the network again.
+        event = _make_event_with_relay_tags(["wss://inbox.example.com"])
+        client.fetch_events.side_effect = None
+        client.fetch_events.return_value = _make_events_result([event])
+
+        assert await detector.check(PUBKEY_HEX) == ["wss://inbox.example.com"]
+        assert client.fetch_events.await_count == 2
+
+    async def test_fetch_error_serves_stale_entry(self) -> None:
+        """An expired cache entry is better than nothing when the refresh
+        fetch fails."""
+        client = AsyncMock()
+        event = _make_event_with_relay_tags(["wss://inbox.example.com"])
+        client.fetch_events.return_value = _make_events_result([event])
+        detector = Nip17Support(client, ttl_seconds=0.0)  # everything expires
+
+        assert await detector.check(PUBKEY_HEX) == ["wss://inbox.example.com"]
+
+        client.fetch_events.side_effect = RuntimeError("relay down")
+        assert await detector.check(PUBKEY_HEX) == ["wss://inbox.example.com"]

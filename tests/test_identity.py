@@ -155,3 +155,32 @@ def test_best_name_falls_back_to_name() -> None:
 def test_best_name_falls_back_to_short_pubkey() -> None:
     i = Identity(pubkey_hex=PUBKEY)
     assert i.best_name == f"{PUBKEY[:8]}..."
+
+
+async def test_fetch_error_not_cached_retries_next_call() -> None:
+    """A fetch failure returns a minimal Identity but must not be cached:
+    the next resolve() should retry the network."""
+    client = AsyncMock()
+    client.fetch_metadata.side_effect = RuntimeError("relay timeout")
+    resolver = IdentityResolver(client)
+
+    ident = await resolver.resolve(PUBKEY)
+    assert ident.name is None
+
+    client.fetch_metadata.side_effect = None
+    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    ident = await resolver.resolve(PUBKEY)
+    assert ident.name == "alice"
+    assert client.fetch_metadata.await_count == 2
+
+
+async def test_fetch_error_serves_stale_entry() -> None:
+    """An expired cached Identity is served when the refresh fetch fails."""
+    client = AsyncMock()
+    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    resolver = IdentityResolver(client, ttl_seconds=0.0)  # everything expires
+
+    assert (await resolver.resolve(PUBKEY)).name == "alice"
+
+    client.fetch_metadata.side_effect = RuntimeError("relay down")
+    assert (await resolver.resolve(PUBKEY)).name == "alice"

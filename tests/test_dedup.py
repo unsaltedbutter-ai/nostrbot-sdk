@@ -49,14 +49,27 @@ def test_expired_entries_pruned_after_prune_every_calls() -> None:
     d: Dedup[str] = Dedup(ttl_seconds=0.01, prune_every=3)
     d.check_and_add("old")
     time.sleep(0.02)
-    # Old is still in the dict because we haven't hit prune_every yet
-    assert "old" in d
+    # Old is expired so no longer reported present, but still stored until
+    # the next prune bounds memory.
+    assert "old" not in d
+    assert "old" in d._seen
     # Three calls (one already happened above as check_and_add) should trigger prune
     d.check_and_add("new1")
     d.check_and_add("new2")
-    # At this point prune should have run; "old" should be gone
-    assert "old" not in d
+    # At this point prune should have run; "old" should be gone from storage
+    assert "old" not in d._seen
     assert "new1" in d
+
+
+def test_expired_key_treated_as_new_without_prune() -> None:
+    """TTL is enforced on lookup itself: an expired key reads as new even if
+    pruning hasn't run (low-traffic bots may go ages between prunes)."""
+    d: Dedup[str] = Dedup(ttl_seconds=0.01, prune_every=10_000)
+    assert d.check_and_add("abc") is False
+    time.sleep(0.02)
+    assert "abc" not in d
+    assert d.check_and_add("abc") is False  # expired -> treated as new
+    assert d.check_and_add("abc") is True   # and re-registered
 
 
 def test_expired_key_returns_false_again_after_prune() -> None:

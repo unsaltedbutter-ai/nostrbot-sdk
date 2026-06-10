@@ -78,40 +78,45 @@ class IdentityResolver:
         """Return the Identity for pubkey_hex.
 
         Cache hit: returns immediately. Miss: fetches kind 0 via the client,
-        parses, caches, returns. Any error returns an Identity with only
-        pubkey_hex set (also cached, to avoid re-fetching).
+        parses, caches, returns. A fetch error returns the stale cached
+        Identity if one exists, else an Identity with only pubkey_hex set;
+        errors are NOT cached, so the next call retries.
         """
         now = time.monotonic()
         entry = self._cache.get(pubkey_hex)
         if entry is not None and (now - entry.timestamp) < self._ttl:
             return entry.identity
 
-        identity = await self._fetch(pubkey_hex)
+        try:
+            identity = await self._fetch(pubkey_hex)
+        except Exception:
+            log.debug(
+                "Failed to resolve identity for %s; not caching",
+                pubkey_hex[:16], exc_info=True,
+            )
+            if entry is not None:
+                return entry.identity
+            return Identity(pubkey_hex=pubkey_hex)
         self._cache[pubkey_hex] = _CacheEntry(identity, now)
         return identity
 
     async def _fetch(self, pubkey_hex: str) -> Identity:
-        try:
-            pk = PublicKey.parse(pubkey_hex)
-            meta = await self._client.fetch_metadata(pk, self._fetch_timeout)
-            if meta is None:
-                return Identity(pubkey_hex=pubkey_hex)
-            data = json.loads(meta.as_json())
-            return Identity(
-                pubkey_hex=pubkey_hex,
-                name=_clean(data.get("name")),
-                display_name=_clean(data.get("display_name")),
-                picture=_clean(data.get("picture")),
-                lud16=_clean(data.get("lud16")),
-                nip05=_clean(data.get("nip05")),
-                website=_clean(data.get("website")),
-                about=_clean(data.get("about")),
-            )
-        except Exception:
-            log.debug(
-                "Failed to resolve identity for %s", pubkey_hex[:16], exc_info=True,
-            )
+        """Fetch and parse kind 0. Raises on fetch/parse errors."""
+        pk = PublicKey.parse(pubkey_hex)
+        meta = await self._client.fetch_metadata(pk, self._fetch_timeout)
+        if meta is None:
             return Identity(pubkey_hex=pubkey_hex)
+        data = json.loads(meta.as_json())
+        return Identity(
+            pubkey_hex=pubkey_hex,
+            name=_clean(data.get("name")),
+            display_name=_clean(data.get("display_name")),
+            picture=_clean(data.get("picture")),
+            lud16=_clean(data.get("lud16")),
+            nip05=_clean(data.get("nip05")),
+            website=_clean(data.get("website")),
+            about=_clean(data.get("about")),
+        )
 
     def invalidate(self, pubkey_hex: str) -> None:
         """Drop the cached entry for `pubkey_hex`, forcing re-fetch next time."""

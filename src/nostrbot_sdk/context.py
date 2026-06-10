@@ -42,15 +42,18 @@ class SenderContext:
     protocol: Protocol
     _bot: NostrBot
 
-    async def reply(self, text: str) -> None:
+    async def reply(self, text: str) -> bool:
         """Send a DM back using the protocol this sender used.
 
-        For DM contexts (nip04/nip17), the bot already knows the protocol
-        from the inbound event and reuses it. For zap contexts the bot has
-        no inbound DM to match against, so it consults kind 10050 and falls
-        back to NIP-04 if the recipient hasn't published one.
+        For NIP-04 senders, the bot replies via NIP-04. For NIP-17 senders
+        and zap contexts, the bot consults the recipient's kind 10050 and
+        delivers to their inbox relays, falling back to NIP-04 (or a
+        best-effort NIP-17 broadcast) as appropriate.
+
+        Returns True if the send succeeded, False otherwise (failures are
+        logged by the bot, never raised).
         """
-        await self._bot.send_dm(self.sender_hex, text)
+        return await self._bot.send_dm(self.sender_hex, text)
 
     async def resolve_identity(self) -> Identity:
         """Fetch this sender's kind 0 metadata (cached)."""

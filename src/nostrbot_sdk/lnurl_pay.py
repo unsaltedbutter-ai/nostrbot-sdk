@@ -35,11 +35,14 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
+
+import bolt11 as bolt11_lib
 
 try:
     import httpx
@@ -64,6 +67,27 @@ DEFAULT_ZAP_RELAYS: list[str] = [
     "wss://relay.damus.io",
     "wss://relay.snort.social",
 ]
+
+
+class LnurlSecurityError(Exception):
+    """The LNURL server returned an invoice that doesn't match the request.
+
+    Raised when the bolt11 from the callback is undecodable or carries a
+    different amount than was requested. Paying such an invoice would send
+    funds the caller never approved, so this aborts the payment outright
+    instead of retrying at another fee tier.
+    """
+
+
+class PaymentOutcomeUnknown(Exception):
+    """The wallet could not determine whether the payment settled.
+
+    Raised on timeouts, dropped connections, 5xx responses, or a payment
+    the backend reports as still pending. The Lightning payment may still
+    settle after this is raised. Callers MUST NOT pay another invoice for
+    the same payout until they have reconciled with the wallet/node —
+    retrying risks paying twice.
+    """
 
 
 @dataclass(frozen=True)
@@ -209,8 +233,15 @@ async def request_invoice(
 ) -> tuple[str, bool]:
     """Hit the LNURL callback, return (bolt11, is_zap).
 
-    `is_zap` is True iff a NIP-57 zap request was attached to the callback
-    (i.e., the recipient gets a public zap receipt).
+    The returned invoice is verified before being handed back (LUD-06
+    requires the payer to check it): its amount MUST equal `amount_msats`,
+    otherwise LnurlSecurityError is raised — a malicious server could
+    otherwise hand us an invoice for an arbitrary amount.
+
+    `is_zap` is True iff a NIP-57 zap request was attached AND the invoice's
+    description_hash commits to it (which is what makes the eventual kind
+    9735 receipt verifiable). If the server ignored the zap request's
+    commitment, the payment still proceeds but is_zap is False.
     """
     separator = "&" if "?" in params.callback else "?"
     url = f"{params.callback}{separator}amount={amount_msats}"
@@ -235,7 +266,43 @@ async def request_invoice(
     if not bolt11:
         raise ValueError("LNURL-pay callback did not return a payment request")
 
+    invoice = _verify_invoice_amount(bolt11, amount_msats)
+
+    if is_zap:
+        expected_hash = hashlib.sha256(
+            zap_request_json.encode("utf-8"),
+        ).hexdigest()
+        if invoice.description_hash != expected_hash:
+            log.warning(
+                "LNURL callback invoice does not commit to the zap request "
+                "(description_hash mismatch); paying as plain LNURL — the "
+                "recipient will not get a verifiable zap receipt",
+            )
+            is_zap = False
+
     return bolt11, is_zap
+
+
+def _verify_invoice_amount(bolt11_str: str, amount_msats: int):
+    """Decode `bolt11_str` and require its amount to equal `amount_msats`.
+
+    Returns the decoded invoice. Raises LnurlSecurityError on an
+    undecodable invoice or an amount mismatch (including amountless
+    invoices, where the payer's wallet would decide the amount).
+    """
+    try:
+        invoice = bolt11_lib.decode(bolt11_str)
+    except Exception as e:
+        raise LnurlSecurityError(
+            "LNURL callback returned an undecodable bolt11 invoice",
+        ) from e
+    if invoice.amount_msat != amount_msats:
+        raise LnurlSecurityError(
+            f"LNURL callback returned an invoice for "
+            f"{invoice.amount_msat} msats, but {amount_msats} msats was "
+            f"requested; refusing to pay",
+        )
+    return invoice
 
 
 # -- Invoice wallet protocol ---------------------------------------------------
@@ -279,6 +346,14 @@ class BtcPayWallet:
     async def pay(
         self, bolt11: str, max_fee_percent: float | None = None,
     ) -> tuple[int, int]:
+        """Pay `bolt11` via BTCPay.
+
+        Raises PaymentOutcomeUnknown when the result cannot be determined
+        (timeout, dropped connection, 5xx, or BTCPay reporting the payment
+        as pending) — in those cases the payment may still settle, so the
+        caller must not retry with a fresh invoice. Other exceptions mean
+        the payment definitively did not happen.
+        """
         endpoint = (
             f"{self._url}/api/v1/stores/{self._store_id}"
             f"/lightning/BTC/invoices/pay"
@@ -287,17 +362,41 @@ class BtcPayWallet:
         if max_fee_percent is not None:
             body["maxFeePercent"] = max_fee_percent
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                endpoint,
-                json=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"token {self._api_key}",
-                },
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    endpoint,
+                    json=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"token {self._api_key}",
+                    },
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            # The request never reached BTCPay: definitively not paid.
+            raise
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            # The request may have reached BTCPay; the HTLC could still be
+            # in flight and settle minutes later.
+            raise PaymentOutcomeUnknown(
+                f"BTCPay pay request did not complete: {e!r}",
+            ) from e
+
+        if resp.status_code >= 500:
+            raise PaymentOutcomeUnknown(
+                f"BTCPay returned HTTP {resp.status_code}; "
+                f"the payment may still settle",
             )
-            resp.raise_for_status()
-            data = resp.json()
+        resp.raise_for_status()
+        data = resp.json()
+
+        status = str(data.get("status", "")).lower()
+        if status == "failed":
+            raise ValueError("BTCPay reports the payment failed")
+        if status == "pending":
+            raise PaymentOutcomeUnknown(
+                "BTCPay reports the payment as pending; it may still settle",
+            )
 
         total_msats = data.get("totalAmount", 0)
         if isinstance(total_msats, str):
@@ -367,6 +466,16 @@ class LnurlPayer:
 
         `comment` overrides the default; `source_url` is embedded in the
         default comment (e.g., a tweet URL or nevent for context).
+
+        Raises:
+            LnurlSecurityError: the server returned an invoice whose amount
+                doesn't match the request. Nothing was paid.
+            PaymentOutcomeUnknown: a payment attempt's outcome could not be
+                determined (timeout / pending). No further tier is tried —
+                paying another invoice could double-pay. Reconcile with the
+                wallet before retrying this payout.
+            RuntimeError: every fee tier definitively failed. Nothing was
+                paid.
         """
         params = await resolve_lud16(lud16)
         msg = self._build_comment(comment, source_url)
@@ -416,7 +525,12 @@ class LnurlPayer:
         zap_target_pubkey: str | None,
         comment: str,
     ) -> PayoutResult | None:
-        """Try a single (amount, fee_cap) tier. Returns None on payment failure."""
+        """Try a single (amount, fee_cap) tier.
+
+        Returns None on definitive failure (caller tries the next tier).
+        Raises LnurlSecurityError or PaymentOutcomeUnknown to abort all
+        tiers.
+        """
         amount_msats = amount_sats * 1000
 
         if amount_msats < params.min_sendable:
@@ -453,6 +567,13 @@ class LnurlPayer:
                 params, amount_msats,
                 zap_request_json=zap_json, comment=comment,
             )
+        except LnurlSecurityError:
+            # Wrong-amount or undecodable invoice: the server is broken or
+            # hostile. Another tier would get the same treatment; abort.
+            log.error(
+                "LNURL server for %s returned a bad invoice; aborting", lud16,
+            )
+            raise
         except Exception:
             log.info(
                 "Invoice request failed at %.1f%% tier for %d sats to %s",
@@ -464,6 +585,15 @@ class LnurlPayer:
             total_sats, fee_sats = await self._wallet.pay(
                 bolt11, max_fee_percent=max_fee_pct,
             )
+        except PaymentOutcomeUnknown:
+            # The payment may still settle. Trying another tier would pay a
+            # SECOND invoice for the same payout — never retry past this.
+            log.error(
+                "Payment outcome unknown for %d sats to %s; aborting tier "
+                "retries to avoid double-payment",
+                amount_sats, lud16,
+            )
+            raise
         except Exception:
             log.info(
                 "Payment failed at %.1f%% fee cap for %d sats to %s",

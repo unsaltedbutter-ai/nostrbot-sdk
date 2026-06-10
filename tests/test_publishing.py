@@ -106,6 +106,30 @@ class TestBuildNoteTagsReply:
         assert len(e_tags) == 1
         assert _tag_vec(e_tags[0])[3] == "root"
 
+    def test_reply_to_author_emits_p_tag(self) -> None:
+        """NIP-10: replies should p-tag the parent author so they get
+        notified."""
+        author = Keys.generate().public_key().to_hex()
+        tags = build_note_tags(reply_to="aa" * 32, reply_to_author=author)
+        p_tags = [t for t in tags if _tag_vec(t)[0] == "p"]
+        assert len(p_tags) == 1
+        assert _tag_vec(p_tags[0])[1] == author
+
+    def test_reply_to_author_deduped_against_mentions(self) -> None:
+        author = Keys.generate().public_key().to_hex()
+        tags = build_note_tags(
+            reply_to="aa" * 32,
+            reply_to_author=author,
+            mention_pubkeys=[author],
+        )
+        p_tags = [t for t in tags if _tag_vec(t)[0] == "p"]
+        assert len(p_tags) == 1
+
+    def test_reply_to_author_ignored_without_reply_to(self) -> None:
+        author = Keys.generate().public_key().to_hex()
+        tags = build_note_tags(reply_to_author=author)
+        assert not any(_tag_vec(t)[0] == "p" for t in tags)
+
 
 # -- build_note_tags: NIP-18 quote --------------------------------------------
 

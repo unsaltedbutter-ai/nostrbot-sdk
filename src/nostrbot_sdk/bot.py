@@ -130,6 +130,22 @@ class NostrBotConfig:
     DM arriving via both NIP-04 and NIP-17. Short, so genuine retries get
     through."""
 
+    zap_dedup_ttl_seconds: float = 24 * 3600.0
+    """How long a validated zap receipt's event id is remembered so a
+    replayed kind 9735 (e.g., from a malicious or buggy relay) can't
+    re-trigger on_zap. This is in-memory only: handlers that credit
+    balances should additionally persist processed event ids so replays
+    across bot restarts are also rejected."""
+
+    user_protocol_ttl_seconds: float = 24 * 3600.0
+    """How long the per-sender "last protocol seen" hint is kept. After it
+    expires, send_dm falls back to the kind 10050 lookup. Also bounds the
+    memory used to track senders in a long-running bot."""
+
+    shutdown_grace_seconds: float = 10.0
+    """How long stop() waits for in-flight DM/zap handler tasks to finish
+    before cancelling them."""
+
     user_lock_idle_seconds: float = 300.0
     """How long a per-user lock can sit idle before cleanup."""
 
@@ -164,6 +180,9 @@ class NostrBot:
         self._dedup_content: Dedup[tuple[str, str]] = Dedup(
             ttl_seconds=config.dedup_content_ttl_seconds,
         )
+        self._dedup_zap: Dedup[str] = Dedup(
+            ttl_seconds=config.zap_dedup_ttl_seconds,
+        )
         self._locks = UserLockManager(idle_seconds=config.user_lock_idle_seconds)
         self._nip17_support = Nip17Support(
             self._client, ttl_seconds=config.nip17_cache_ttl_seconds,
@@ -173,7 +192,9 @@ class NostrBot:
         )
 
         # Per-user "last protocol seen" used by send_dm to match replies.
-        self._user_protocol: dict[str, str] = {}
+        # Values are (protocol, monotonic_timestamp); entries older than
+        # user_protocol_ttl_seconds are ignored and pruned by maintenance.
+        self._user_protocol: dict[str, tuple[str, float]] = {}
 
         # start_time gate to drop events older than the bot's startup time.
         # Set in start(), so events before start() are not dropped.
@@ -187,6 +208,11 @@ class NostrBot:
 
         # Lifecycle.
         self._tasks: list[asyncio.Task] = []
+        # Per-event handler tasks spawned by _NotifyBridge. Strong references
+        # are required: asyncio keeps only weak refs to tasks, so an untracked
+        # fire-and-forget task can be garbage-collected mid-flight. stop()
+        # also waits for these so in-flight DMs aren't dropped on shutdown.
+        self._inflight: set[asyncio.Task] = set()
         self._shutdown = asyncio.Event()
         self._started = False
 
@@ -270,53 +296,93 @@ class NostrBot:
 
     # -- DM sending ------------------------------------------------------------
 
-    async def send_dm(self, recipient_hex: str, text: str) -> None:
+    async def send_dm(self, recipient_hex: str, text: str) -> bool:
         """Send a DM to `recipient_hex` using their preferred protocol.
 
         Priority:
-          1. If `recipient_hex` recently sent us a DM, reply in the same
-             protocol (NIP-04 in -> NIP-04 out; NIP-17 in -> NIP-17 out).
+          1. If `recipient_hex` recently sent us a DM via NIP-04, reply
+             via NIP-04.
           2. Otherwise consult their kind 10050. If found, NIP-17 to those
              inbox relays (added permanently to the pool to avoid TIME_WAIT
-             socket churn).
-          3. Fall back to NIP-04.
+             socket churn). This applies to NIP-17 repliers too: without
+             gossip, `send_private_msg` would publish only to OUR relay
+             pool, which the recipient may never read.
+          3. If they reached us via NIP-17 but no 10050 is found right now,
+             best-effort NIP-17 to our own pool.
+          4. Fall back to NIP-04.
+
+        Returns True if the send succeeded, False if it failed (errors are
+        logged, never raised).
         """
         try:
             pk = PublicKey.parse(recipient_hex)
-            protocol = self._user_protocol.get(recipient_hex)
+            protocol = self._get_user_protocol(recipient_hex)
             exp = expiration_tag(self._config.dm_expiry_seconds)
 
-            if protocol == "nip17":
-                await self._client.send_private_msg(pk, text, [exp])
-                log.info("Sent nip17 DM to %s (%d chars)", recipient_hex[:16], len(text))
-            elif protocol == "nip04":
+            if protocol == "nip04":
                 await self._send_nip04(pk, text, exp)
                 log.info("Sent nip04 DM to %s (%d chars)", recipient_hex[:16], len(text))
+                return True
+
+            dm_relays = await self._nip17_support.check(recipient_hex)
+            if dm_relays:
+                relay_urls = [RelayUrl.parse(r) for r in dm_relays]
+                added: list[RelayUrl] = []
+                for ru in relay_urls:
+                    if await self._client.add_relay(ru):
+                        added.append(ru)
+                if added:
+                    await self._client.connect()
+                await self._client.send_private_msg_to(
+                    relay_urls, pk, text, [exp],
+                )
+                log.info(
+                    "Sent nip17 DM to %s (%d chars, %d inbox relays)",
+                    recipient_hex[:16], len(text), len(dm_relays),
+                )
+            elif protocol == "nip17":
+                # They DM'd us via NIP-17 so they do support it, but we can't
+                # find their inbox relays right now. Best effort: gift wrap
+                # to our own pool and hope for relay overlap.
+                await self._client.send_private_msg(pk, text, [exp])
+                log.info(
+                    "Sent nip17 DM to %s (%d chars, own pool; no kind 10050 found)",
+                    recipient_hex[:16], len(text),
+                )
             else:
-                dm_relays = await self._nip17_support.check(recipient_hex)
-                if dm_relays:
-                    relay_urls = [RelayUrl.parse(r) for r in dm_relays]
-                    added: list[RelayUrl] = []
-                    for ru in relay_urls:
-                        if await self._client.add_relay(ru):
-                            added.append(ru)
-                    if added:
-                        await self._client.connect()
-                    await self._client.send_private_msg_to(
-                        relay_urls, pk, text, [exp],
-                    )
-                    log.info(
-                        "Sent nip17 DM to %s (%d chars, %d inbox relays)",
-                        recipient_hex[:16], len(text), len(dm_relays),
-                    )
-                else:
-                    await self._send_nip04(pk, text, exp)
-                    log.info(
-                        "Sent nip04 DM to %s (%d chars, fallback)",
-                        recipient_hex[:16], len(text),
-                    )
+                await self._send_nip04(pk, text, exp)
+                log.info(
+                    "Sent nip04 DM to %s (%d chars, fallback)",
+                    recipient_hex[:16], len(text),
+                )
+            return True
         except Exception:
             log.exception("Failed to send DM to %s", recipient_hex[:16])
+            return False
+
+    def _set_user_protocol(self, sender_hex: str, protocol: str) -> None:
+        self._user_protocol[sender_hex] = (protocol, time.monotonic())
+
+    def _get_user_protocol(self, sender_hex: str) -> str | None:
+        entry = self._user_protocol.get(sender_hex)
+        if entry is None:
+            return None
+        protocol, ts = entry
+        if time.monotonic() - ts > self._config.user_protocol_ttl_seconds:
+            self._user_protocol.pop(sender_hex, None)
+            return None
+        return protocol
+
+    def _prune_user_protocol(self) -> int:
+        """Drop expired protocol hints. Returns count removed."""
+        now = time.monotonic()
+        ttl = self._config.user_protocol_ttl_seconds
+        stale = [
+            k for k, (_, ts) in self._user_protocol.items() if now - ts > ttl
+        ]
+        for k in stale:
+            del self._user_protocol[k]
+        return len(stale)
 
     async def _send_nip04(self, pk: PublicKey, text: str, exp_tag: Tag) -> None:
         ciphertext = await self._signer.nip04_encrypt(pk, text)
@@ -332,8 +398,9 @@ class NostrBot:
         """Publish a kind 1 note. See nostrbot_sdk.publishing.send_note for kwargs.
 
         Reuses the bot's connected client (no per-call connect/disconnect).
-        Common kwargs: reply_to, reply_root, quote, quote_author,
-        mention_pubkeys, hashtags, expiration_seconds, extra_tags.
+        Common kwargs: reply_to, reply_root, reply_to_author, quote,
+        quote_author, mention_pubkeys, hashtags, expiration_seconds,
+        extra_tags.
         """
         return await send_note(self._client, content, **kw)
 
@@ -356,6 +423,9 @@ class NostrBot:
         """
         if self._started:
             raise RuntimeError("NostrBot already started")
+        # Allow start() after a prior stop(): background loops and run()
+        # watch this event, so a stale set() would make them exit instantly.
+        self._shutdown = asyncio.Event()
 
         # 1. Add relays + connect.
         for relay in self._config.relays:
@@ -407,16 +477,18 @@ class NostrBot:
             .kind(Kind.from_std(KindStandard.GIFT_WRAP))
             .limit(0)
         )
+        # Start consuming notifications BEFORE subscribing so events that
+        # arrive immediately after the subscription are not dropped.
+        self._tasks.append(asyncio.create_task(
+            self._client.handle_notifications(_NotifyBridge(self)),
+            name="nostrbot_notifications",
+        ))
         await self._client.subscribe(f_legacy)
         await self._client.subscribe(f_giftwrap)
         log.info("Subscribed to kind 4, 1059, 9735")
 
         # 6. Background tasks.
         start_mono = time.monotonic()
-        self._tasks.append(asyncio.create_task(
-            self._client.handle_notifications(_NotifyBridge(self)),
-            name="nostrbot_notifications",
-        ))
         self._tasks.append(asyncio.create_task(
             self._maintenance_loop(),
             name="nostrbot_maintenance",
@@ -433,10 +505,17 @@ class NostrBot:
         )
 
     async def stop(self) -> None:
-        """Cancel background tasks, disconnect from relays, return cleanly."""
+        """Cancel background tasks, drain in-flight handlers, disconnect.
+
+        In-flight DM/zap handler tasks get `shutdown_grace_seconds` to
+        finish (the client is still connected, so they can reply); whatever
+        is left after the grace period is cancelled.
+        """
         if not self._started:
             return
         self._shutdown.set()
+        # Cancel background loops first: this stops the notification bridge,
+        # so no NEW handler tasks are spawned while we drain.
         for t in self._tasks:
             t.cancel()
         for t in self._tasks:
@@ -447,6 +526,26 @@ class NostrBot:
             except Exception:
                 log.exception("Task error on shutdown")
         self._tasks.clear()
+
+        pending = [t for t in self._inflight if not t.done()]
+        if pending:
+            log.info(
+                "Waiting up to %.0fs for %d in-flight handler(s)",
+                self._config.shutdown_grace_seconds, len(pending),
+            )
+            _, still_pending = await asyncio.wait(
+                pending, timeout=self._config.shutdown_grace_seconds,
+            )
+            if still_pending:
+                log.warning(
+                    "Cancelling %d handler(s) still running after grace period",
+                    len(still_pending),
+                )
+                for t in still_pending:
+                    t.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
+        self._inflight.clear()
+
         try:
             await self._client.disconnect()
         except Exception:
@@ -545,6 +644,8 @@ class NostrBot:
         protocol: str,
     ) -> None:
         """Route an inbound DM to a push handler or the user DM handler."""
+        content_key = (sender_hex, content.strip())
+
         # System push (sender is a known backend)?
         push_tag = self._config.accept_pushes_from.get(sender_hex)
         if push_tag is not None:
@@ -555,9 +656,17 @@ class NostrBot:
                     sender_hex[:16], push_tag,
                 )
                 return
+            # Backends sending via both NIP-04 and NIP-17 for compat need
+            # the same content dedup as user DMs.
+            if self._dedup_content.check_and_add(content_key):
+                log.debug(
+                    "Duplicate push content from %s, skipping", sender_hex[:16],
+                )
+                return
             try:
                 await handler(content)
             except Exception:
+                self._dedup_content.forget(content_key)
                 log.exception(
                     "Push handler %r failed for sender %s",
                     push_tag, sender_hex[:16],
@@ -565,9 +674,8 @@ class NostrBot:
             return
 
         # User DM.
-        self._user_protocol[sender_hex] = protocol
+        self._set_user_protocol(sender_hex, protocol)
 
-        content_key = (sender_hex, content.strip())
         if self._dedup_content.check_and_add(content_key):
             log.debug("Duplicate content from %s, skipping", sender_hex[:16])
             return
@@ -609,6 +717,16 @@ class NostrBot:
             zap_provider_pubkey_hex=self._config.zap_provider_pubkey,
         )
         if zap is None:
+            return
+
+        # Long-TTL replay guard: the general event dedup (10 min) is too
+        # short for payment-grade idempotency; a relay redelivering a valid
+        # receipt later must not credit the sender twice.
+        if self._dedup_zap.check_and_add(zap.event_id):
+            log.warning(
+                "Replayed zap receipt %s from %s ignored",
+                zap.event_id[:16], zap.sender_hex[:16],
+            )
             return
 
         try:
@@ -669,6 +787,7 @@ class NostrBot:
                     self._locks.cleanup_idle()
                     self._nip17_support.cleanup_expired()
                     self._identity.cleanup_expired()
+                    self._prune_user_protocol()
                 except Exception:
                     log.exception("Maintenance loop error")
         except asyncio.CancelledError:
@@ -679,7 +798,10 @@ class _NotifyBridge(HandleNotification):
     """Bridge between nostr-sdk's notification system and NostrBot._handle_event.
 
     Spawns a task per event so unrelated events process in parallel; same-user
-    events serialize via NostrBot's per-user lock.
+    events serialize via NostrBot's per-user lock. Tasks are tracked in the
+    bot's _inflight set: asyncio holds only weak references to tasks, so an
+    untracked task could be garbage-collected mid-flight, and stop() needs
+    the set to drain handlers gracefully.
     """
 
     def __init__(self, bot: NostrBot) -> None:
@@ -688,7 +810,9 @@ class _NotifyBridge(HandleNotification):
     async def handle(
         self, relay_url: RelayUrl, subscription_id: str, event: Event,
     ) -> None:
-        asyncio.create_task(self._bot._handle_event(event))
+        task = asyncio.create_task(self._bot._handle_event(event))
+        self._bot._inflight.add(task)
+        task.add_done_callback(self._bot._inflight.discard)
 
     async def handle_msg(self, relay_url: RelayUrl, msg: RelayMessage) -> None:
         pass

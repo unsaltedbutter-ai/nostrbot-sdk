@@ -61,6 +61,8 @@ try:
         InvoiceWallet,
         LnurlPayer,
         LnurlPayParams,
+        LnurlSecurityError,
+        PaymentOutcomeUnknown,
         PayoutResult,
     )
 except ImportError:
@@ -77,9 +79,11 @@ __all__ = [
     "InvoiceWallet",
     "LnurlPayParams",
     "LnurlPayer",
+    "LnurlSecurityError",
     "Nip17Support",
     "NostrBot",
     "NostrBotConfig",
+    "PaymentOutcomeUnknown",
     "PayoutResult",
     "PublishResult",
     "Publisher",
@@ -95,4 +99,4 @@ __all__ = [
     "validate_zap_receipt",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

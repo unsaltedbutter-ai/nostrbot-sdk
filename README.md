@@ -6,8 +6,8 @@ so your bot code can stay focused on what it actually does.
 
 Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (pinned to `0.44.2`).
 
-**Status:** **v0.4.0 shipped.** The full runtime, LNURL-pay, and publishing are all
-callable today. 167 tests, MIT licensed. Each feature section below carries a
+**Status:** **v0.5.0 shipped.** The full runtime, LNURL-pay, and publishing are all
+callable today. 195 tests, MIT licensed. Each feature section below carries a
 `(vX.Y.Z)` tag indicating the minimum version it landed in; pin to that or later.
 See [Versions](#versions) for the shipped-when changelog.
 
@@ -67,12 +67,20 @@ async def handle_push(raw: str) -> None:
 async def heartbeat(uptime_s: int) -> None:
     ...
 
-# Also publish notes using the bot's already-connected client:
+await bot.run()  # SIGINT/SIGTERM hooked up; blocks until shutdown
+```
+
+Notes are published with the bot's already-connected client, so `post_note`
+needs a *started* bot — call it from inside a handler, or drive the lifecycle
+yourself:
+
+```python
+await bot.start()
 result = await bot.post_note("hello nostr", hashtags=["nostr", "introductions"])
 if result.ok:
     print(f"published to {result.relay_count} relays: {result.note_id}")
-
-await bot.run()  # SIGINT/SIGTERM hooked up; blocks until shutdown
+...
+await bot.stop()
 ```
 
 For one-shot scripts (cron, CLI tools) that only need to publish, use `Publisher`:
@@ -266,6 +274,12 @@ two, three, sometimes five times per inbound message; if it has side effects (se
 a reply, charges a user, writes to a DB) you get duplicate side effects. The dedup
 dict is bounded and self-pruning.
 
+Zap receipts get a second, much longer replay window (24h by default,
+`zap_dedup_ttl_seconds`): a malicious relay redelivering a valid kind 9735 after
+the 10-minute event dedup expires must not credit the sender twice. This guard is
+in-memory — zap handlers that credit balances should also persist processed event
+ids so replays across bot restarts are rejected too.
+
 ### Content deduplication (v0.2.0)
 
 In addition to event-id dedup, `NostrBot` skips any `(sender_hex, content)` pair seen
@@ -298,11 +312,18 @@ sends).
 
 **Why it matters.** If a user reaches you via NIP-04 (legacy clients still common),
 replying via NIP-17 means they cannot see your reply. If a user reaches you via
-NIP-17, replying via NIP-04 leaks metadata they were trying to avoid. The rule is:
+NIP-17, replying via NIP-04 leaks metadata they were trying to avoid. And NIP-17
+replies must go to the *recipient's* kind 10050 inbox relays — broadcasting the
+gift wrap to your own relay pool only works if the user happens to read from it.
+The rule is:
 
-1. If the user has DM'd you before, match the protocol of their most recent DM
-2. Otherwise (proactive/outbound), check their kind 10050; if found, NIP-17 to
-   their inbox relays; if not, NIP-04
+1. If the user's most recent DM was NIP-04, reply via NIP-04
+2. Otherwise (NIP-17 replier, or proactive/outbound), check their kind 10050;
+   if found, NIP-17 to their inbox relays; if they DM'd you via NIP-17 but no
+   10050 is findable right now, best-effort NIP-17 to your own pool; else NIP-04
+
+`send_dm` / `ctx.reply` return `True` on success and `False` on failure (errors
+are logged, never raised).
 
 **Usage.**
 
@@ -341,6 +362,8 @@ push handler.
 **Usage.**
 
 ```python
+import json
+
 cfg = NostrBotConfig(
     nsec="...",
     relays=[...],
@@ -351,7 +374,9 @@ cfg = NostrBotConfig(
 )
 
 @bot.on_push("backend")
-async def handle_backend(payload: dict) -> None:
+async def handle_backend(raw: str) -> None:
+    # Push handlers receive the raw decrypted plaintext; parse it yourself.
+    payload = json.loads(raw)
     if payload["type"] == "payment_received":
         await bot.send_dm(payload["user"], "thanks for paying!")
 ```
@@ -389,6 +414,22 @@ NIP-57 zap receipt on Nostr, which is much better social signaling. The library
 also handles **graduated fee-tier retries** so a fee-inflating routing node can't
 either fail the payment or extract value from your margin — total outflow per
 payment is capped at `amount_sats + operator_contribution_sats` (default 2).
+
+Two safety properties on top of that:
+
+- **Invoice verification (LUD-06).** The bolt11 returned by the LNURL callback
+  is decoded and its amount must equal what was requested, otherwise
+  `LnurlSecurityError` is raised and nothing is paid — a malicious server can't
+  hand you an invoice for an arbitrary amount. For zaps, the invoice's
+  `description_hash` must also commit to the zap request; if it doesn't, the
+  payment proceeds but is treated as plain LNURL (no fake zap receipt claim).
+- **No retry on unknown outcome.** If a wallet call times out or the backend
+  reports the payment as pending, the Lightning payment may still settle.
+  `PaymentOutcomeUnknown` is raised and **no further fee tier is tried** —
+  paying a fresh invoice at that point could double-pay. Reconcile with your
+  node before retrying that payout. Custom `InvoiceWallet` implementations
+  should raise `PaymentOutcomeUnknown` for timeouts/pending and plain errors
+  only for definitive failures.
 
 **Usage.** Requires `pip install "nostrbot-sdk[lnurl]"`.
 
@@ -446,10 +487,11 @@ call works for the simplest case, but the moment you want to **reply**, **quote*
 accepted the event**, you're rebuilding the same plumbing. Three specific gotchas:
 
 - **NIP-10 reply threading**: replies need an `e`-tag marked `"root"` for the
-  thread root and (separately) `"reply"` for the immediate parent. Get this wrong
-  and your reply shows up as a top-level post, not under the parent. The library
-  takes `reply_to=<parent_id>` and optionally `reply_root=<root_id>`; emits the
-  right marked tags.
+  thread root and (separately) `"reply"` for the immediate parent, plus a
+  `p`-tag for the parent author (or they never see your reply in their
+  notifications). Get this wrong and your reply shows up as a top-level post,
+  not under the parent. The library takes `reply_to=<parent_id>`, optionally
+  `reply_root=<root_id>`, and `reply_to_author=<hex>`; emits the right tags.
 - **NIP-18 quoting**: requires a `q`-tag for the quoted event PLUS a `p`-tag for
   the quoted author (so they see it in notifications). Library does both from
   `quote=<id>` + `quote_author=<hex>`.
@@ -473,6 +515,7 @@ await bot.post_note(
     "good question",
     reply_to=parent_event_id_hex,
     reply_root=thread_root_event_id_hex,   # omit if reply_to IS the root
+    reply_to_author=parent_author_hex,     # p-tag so the author is notified
 )
 
 # Quote another note (NIP-18):
@@ -609,7 +652,33 @@ The library does the dance for you.
 
 ## Versions
 
-- **v0.4.0** (current) — publishing.
+- **v0.5.0** (current) — correctness, safety, and lifecycle hardening.
+  - **LNURL-pay safety**: bolt11 invoices from the callback are decoded and
+    verified (amount must match the request; zap invoices must commit to the
+    zap request via `description_hash`). New `LnurlSecurityError`. Wallet
+    failures are now classified: new `PaymentOutcomeUnknown` (timeout / 5xx /
+    pending) aborts fee-tier retries so an in-flight payment can't be
+    double-paid; `BtcPayWallet` checks the BTCPay `status` field.
+  - **Dedup TTL enforced on lookup**: an expired entry reads as new even
+    before pruning runs — low-traffic bots no longer drop legitimate retries.
+  - **NIP-17 reply delivery**: replies to NIP-17 senders now go to the
+    recipient's kind 10050 inbox relays (previously broadcast to the bot's
+    own pool, which the recipient may never read).
+  - **Zap replay guard**: validated receipt ids remembered for 24h
+    (`zap_dedup_ttl_seconds`), closing a replay-after-dedup-expiry
+    double-credit window.
+  - **Lifecycle**: handler tasks are strongly referenced (no GC'd in-flight
+    DMs) and drained on stop() with `shutdown_grace_seconds`; notification
+    consumer starts before subscribing; bots are restartable after stop().
+  - **Caches**: transient fetch failures are no longer negative-cached by
+    `Nip17Support` / `IdentityResolver`; stale entries are served instead.
+  - **Memory**: per-user protocol hints expire (`user_protocol_ttl_seconds`).
+  - **Push channel**: content dedup applied (dual NIP-04/NIP-17 backend
+    sends no longer double-process).
+  - **NIP-10**: new `reply_to_author` param adds the parent author's p-tag.
+  - `send_dm` / `ctx.reply` now return `bool` instead of silently swallowing
+    failures.
+- **v0.4.0** — publishing.
   - `NostrBot.post_note` / `NostrBot.post_article` on a running bot.
   - `Publisher` (async context manager) for one-shot cron / CLI scripts.
   - `PublishResult` with `.ok`, `success_relays`, `failed_relays`, `event_id`,
@@ -648,16 +717,16 @@ Not on PyPI yet. Install from the public GitHub repo, pinned to a tag:
 
 ```bash
 # Core (NostrBot, publishing, primitives):
-pip install "nostrbot-sdk @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.4.0"
+pip install "nostrbot-sdk @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0"
 
 # With LNURL-pay (adds httpx):
-pip install "nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.4.0"
+pip install "nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0"
 ```
 
 In a `requirements.txt`:
 
 ```text
-nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.4.0
+nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0
 ```
 
 ## Development
