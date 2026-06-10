@@ -6,8 +6,8 @@ so your bot code can stay focused on what it actually does.
 
 Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (pinned to `0.44.2`).
 
-**Status:** **v0.5.0 shipped.** The full runtime, LNURL-pay, and publishing are all
-callable today. 195 tests, MIT licensed. Each feature section below carries a
+**Status:** **v0.5.1 shipped.** The full runtime, LNURL-pay, and publishing are all
+callable today. 197 tests, MIT licensed. Each feature section below carries a
 `(vX.Y.Z)` tag indicating the minimum version it landed in; pin to that or later.
 See [Versions](#versions) for the shipped-when changelog.
 
@@ -652,7 +652,12 @@ The library does the dance for you.
 
 ## Versions
 
-- **v0.5.0** (current) — correctness, safety, and lifecycle hardening.
+- **v0.5.1** (current) — lifecycle fix.
+  - `run()` no longer re-calls `start()` on an already-started bot, so the
+    `await bot.start()` → publish → `await bot.run()` sequence works instead
+    of raising `RuntimeError` after the bot is already connected. A genuine
+    double-`start()` still fails loudly.
+- **v0.5.0** — correctness, safety, and lifecycle hardening.
   - **LNURL-pay safety**: bolt11 invoices from the callback are decoded and
     verified (amount must match the request; zap invoices must commit to the
     zap request via `description_hash`). New `LnurlSecurityError`. Wallet
@@ -717,16 +722,16 @@ Not on PyPI yet. Install from the public GitHub repo, pinned to a tag:
 
 ```bash
 # Core (NostrBot, publishing, primitives):
-pip install "nostrbot-sdk @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0"
+pip install "nostrbot-sdk @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.1"
 
 # With LNURL-pay (adds httpx):
-pip install "nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0"
+pip install "nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.1"
 ```
 
 In a `requirements.txt`:
 
 ```text
-nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.0
+nostrbot-sdk[lnurl] @ git+https://github.com/unsaltedbutter-ai/nostrbot-sdk.git@v0.5.1
 ```
 
 ## Development

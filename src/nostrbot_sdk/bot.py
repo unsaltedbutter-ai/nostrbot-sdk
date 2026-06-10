@@ -558,8 +558,13 @@ class NostrBot:
 
         Convenience wrapper. If you need to interleave with other async
         services, use start() + your own shutdown trigger + stop() instead.
+
+        If the bot is already started (e.g., you called start() to publish
+        something before handing control to run()), start() is skipped and
+        run() just attaches signal handling and blocks until shutdown.
         """
-        await self.start()
+        if not self._started:
+            await self.start()
         loop = asyncio.get_running_loop()
         handlers_installed: list[int] = []
         for sig in (signal.SIGINT, signal.SIGTERM):

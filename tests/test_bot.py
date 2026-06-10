@@ -524,6 +524,28 @@ async def test_stop_waits_for_inflight_handlers(bot) -> None:
     bot._client.disconnect.assert_awaited_once()
 
 
+# -- run() / start() lifecycle ---------------------------------------------------
+
+
+async def test_run_skips_start_when_already_started(bot) -> None:
+    """start() followed by run() must not raise: run() skips start() and just
+    attaches signal handling, blocks until shutdown, then stops."""
+    bot._started = True  # simulate a prior successful start()
+    bot._client.disconnect = AsyncMock()
+    bot.start = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("run() must not re-call start()"),
+    )
+    bot._shutdown.set()  # make run() return immediately
+    await bot.run()  # must not raise
+    bot._client.disconnect.assert_awaited_once()  # stop() ran
+
+
+async def test_start_still_raises_on_genuine_double_start(bot) -> None:
+    bot._started = True
+    with pytest.raises(RuntimeError, match="already started"):
+        await bot.start()
+
+
 # -- _handle_event: dedup ------------------------------------------------------
 
 
