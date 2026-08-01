@@ -252,13 +252,13 @@ class TestBuildArticleTags:
 
 async def test_send_note_returns_publish_result_on_success() -> None:
     client = MagicMock()
-    client.send_event_builder = AsyncMock(
+    client.send_event = AsyncMock(
         return_value=_output_mock(
             event_id_hex="cd" * 32,
             success=["wss://relay1/", "wss://relay2/"],
         ),
     )
-    result = await send_note(client, "hello world")
+    result = await send_note(client, "hello world", signer=Keys.generate())
     assert isinstance(result, PublishResult)
     assert result.event_id == "cd" * 32
     assert result.note_id.startswith("note1")
@@ -271,13 +271,13 @@ async def test_send_note_returns_publish_result_on_success() -> None:
 
 async def test_send_note_captures_failed_relays() -> None:
     client = MagicMock()
-    client.send_event_builder = AsyncMock(
+    client.send_event = AsyncMock(
         return_value=_output_mock(
             success=["wss://relay1/"],
             failed={"wss://relay2/": "timeout"},
         ),
     )
-    result = await send_note(client, "x")
+    result = await send_note(client, "x", signer=Keys.generate())
     assert result.success_relays == ["wss://relay1/"]
     assert result.failed_relays == {"wss://relay2/": "timeout"}
     assert result.ok is True  # at least one relay accepted
@@ -285,13 +285,13 @@ async def test_send_note_captures_failed_relays() -> None:
 
 async def test_send_note_zero_relays_means_not_ok() -> None:
     client = MagicMock()
-    client.send_event_builder = AsyncMock(
+    client.send_event = AsyncMock(
         return_value=_output_mock(
             success=[],
             failed={"wss://r1/": "rejected", "wss://r2/": "auth required"},
         ),
     )
-    result = await send_note(client, "x")
+    result = await send_note(client, "x", signer=Keys.generate())
     assert result.ok is False
     assert result.relay_count == 0
     assert "wss://r1/" in result.failed_relays
@@ -299,14 +299,17 @@ async def test_send_note_zero_relays_means_not_ok() -> None:
 
 async def test_send_note_passes_kwargs_through_tag_builder() -> None:
     client = MagicMock()
-    client.send_event_builder = AsyncMock(return_value=_output_mock(success=["x"]))
+    client.send_event = AsyncMock(return_value=_output_mock(success=["x"]))
     parent = "aa" * 32
-    await send_note(client, "hi", reply_to=parent, hashtags=["nostr"])
-    # send_event_builder was called with a builder; we can't easily inspect the
+    await send_note(
+        client, "hi", signer=Keys.generate(),
+        reply_to=parent, hashtags=["nostr"],
+    )
+    # send_event was called with a signed event; we can't easily inspect the
     # builder's internal tags via the public API, but the fact that send_note
     # completes proves the tag list was built without error. Tag content is
     # already covered by build_note_tags tests.
-    client.send_event_builder.assert_awaited_once()
+    client.send_event.assert_awaited_once()
 
 
 # -- send_article -------------------------------------------------------------
@@ -314,9 +317,10 @@ async def test_send_note_passes_kwargs_through_tag_builder() -> None:
 
 async def test_send_article_kind_is_30023() -> None:
     client = MagicMock()
-    client.send_event_builder = AsyncMock(return_value=_output_mock(success=["x"]))
+    client.send_event = AsyncMock(return_value=_output_mock(success=["x"]))
     result = await send_article(
-        client, "My Article", "# content", identifier="my-article",
+        client, "My Article", "# content",
+        signer=Keys.generate(), identifier="my-article",
     )
     assert result.kind == 30023
 
@@ -324,7 +328,9 @@ async def test_send_article_kind_is_30023() -> None:
 async def test_send_article_requires_identifier() -> None:
     client = MagicMock()
     with pytest.raises(ValueError, match="identifier"):
-        await send_article(client, "t", "c", identifier="")
+        await send_article(
+            client, "t", "c", signer=Keys.generate(), identifier="",
+        )
 
 
 # -- Publisher ----------------------------------------------------------------
@@ -374,7 +380,7 @@ class TestPublisher:
     async def test_post_note_delegates_to_send_note(self) -> None:
         nsec = Keys.generate().secret_key().to_bech32()
         pub = Publisher.from_nsec(nsec, ["wss://relay/"])
-        pub._client.send_event_builder = AsyncMock(
+        pub._client.send_event = AsyncMock(
             return_value=_output_mock(success=["wss://relay/"]),
         )
         result = await pub.post_note("hi", hashtags=["nostr"])
@@ -384,7 +390,7 @@ class TestPublisher:
     async def test_post_article_delegates_to_send_article(self) -> None:
         nsec = Keys.generate().secret_key().to_bech32()
         pub = Publisher.from_nsec(nsec, ["wss://relay/"])
-        pub._client.send_event_builder = AsyncMock(
+        pub._client.send_event = AsyncMock(
             return_value=_output_mock(success=["wss://relay/"]),
         )
         result = await pub.post_article("Title", "Body", identifier="a1")

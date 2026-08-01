@@ -4,10 +4,10 @@ High-level toolkit for building Nostr bots in Python. Handles the protocol plumb
 (DM listening, NIP-17 gift wraps, zap receipt validation, note publishing, LNURL-pay)
 so your bot code can stay focused on what it actually does.
 
-Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (pinned to `0.44.2`).
+Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (`>=0.45.0a7,<0.46`).
 
-**Status:** **v0.5.1 shipped.** The full runtime, LNURL-pay, and publishing are all
-callable today. 197 tests, MIT licensed. Each feature section below carries a
+**Status:** **v0.5.2 shipped.** The full runtime, LNURL-pay, and publishing are all
+callable today. 213 tests, MIT licensed. Each feature section below carries a
 `(vX.Y.Z)` tag indicating the minimum version it landed in; pin to that or later.
 See [Versions](#versions) for the shipped-when changelog.
 
@@ -116,14 +116,15 @@ negative results (default TTL 1 hour) so a typical conversation does one lookup.
 
 ```python
 from nostrbot_sdk import Nip17Support
-from nostr_sdk import RelayUrl
+from nostr_sdk import RelayUrl, SendEventTarget, nip17_make_private_msg_async
 
 detector = Nip17Support(client, ttl_seconds=3600)
 
 dm_relays = await detector.check(recipient_pubkey_hex)
 if dm_relays is not None:
     relay_urls = [RelayUrl.parse(r) for r in dm_relays]
-    await client.send_private_msg_to(relay_urls, pk, "hello", [])
+    wrap = await nip17_make_private_msg_async(signer, pk, "hello")
+    await client.send_event(wrap, target=SendEventTarget.to(relay_urls))
 else:
     # No kind 10050: fall back to NIP-04 (legacy)
     ...
@@ -172,27 +173,58 @@ if zap is None:
 await credit_user(zap.sender_hex, zap.amount_sats)
 ```
 
-### NIP-40 expiration tag helper (v0.1.0)
+### NIP-40 expiration tag helpers (v0.1.0, gift-wrap support in v0.5.2)
 
 `expiration_tag(seconds_from_now=7*24*3600)` returns a NIP-40 tag instructing
 well-behaved relays to drop the event after the given time.
+`dm_expiration_tag(...)` is its gift-wrap-aware sibling.
 
 **Why it matters.** Outbound DMs accumulate on relays forever by default. For a bot
 that sends operational messages ("your invoice is ready", "payment received"), there
 is no reason for those events to live on public infrastructure for years. Attach a
 7-day expiration and relays will garbage-collect them.
 
+For NIP-17 the tag has to go in **two** places. A relay only ever sees the outer
+gift wrap — it cannot read the rumor — so an expiration that lives only inside is
+invisible to it and nothing is ever collected. Put it only on the wrap and the
+recipient's client has no idea the message is meant to expire. `NostrBot.send_dm`
+stamps the same tag on both, so the two never disagree.
+
+**Why the timestamp is backdated.** A gift wrap's `created_at` is deliberately
+randomized up to two days into the past so observers can't tell when a message was
+really sent. A plain `now + 7d` expiration would hand that straight back —
+`expiration - 7d` is the real send time, and 7 days is a guessable default.
+`dm_expiration_tag` therefore anchors to `now - r` for an unpredictable `r` drawn
+from `[0, min(2 days, expiry/4)]`: at least three quarters of the configured
+lifetime survives, the wrap is never born already expired, and the send time stays
+hidden. It logs a warning for expiries at or below the 2-day window, where timing
+privacy is necessarily weaker.
+
 **Usage.**
 
 ```python
-from nostrbot_sdk import expiration_tag
-from nostr_sdk import EventBuilder, Kind, Tag
+from nostrbot_sdk import dm_expiration_tag, expiration_tag
+from nostr_sdk import EventBuilder, Kind, Tag, nip59_make_gift_wrap_async
 
-builder = EventBuilder(Kind(4), ciphertext).tags([
-    Tag.parse(["p", recipient_pk.to_hex()]),
-    expiration_tag(),  # default: 7 days
-])
-await client.send_event_builder(builder)
+# Plain events (kind 4, kind 1, ...): created_at is already the real send time.
+event = await (
+    EventBuilder(Kind(4), ciphertext)
+    .tags([Tag.public_key(recipient_pk), expiration_tag()])  # default: 7 days
+    .finalize_async(signer)
+)
+await client.send_event(event)
+
+# Gift-wrapped NIP-17: one tag, stamped inside AND outside.
+exp = dm_expiration_tag()
+rumor = (
+    EventBuilder(Kind(14), "hello")
+    .tags([Tag.public_key(recipient_pk), exp])
+    .finalize_unsigned(my_pubkey)
+)
+wrap = await nip59_make_gift_wrap_async(
+    signer, recipient_pk, rumor, expiration=None, extra_tags=[exp],
+)
+await client.send_event(wrap)
 
 # Or a different window:
 short_tag = expiration_tag(seconds_from_now=3600)  # 1 hour
@@ -307,7 +339,7 @@ user it has ever spoken to.
 
 `ctx.reply(text)` sends back to the user using their preferred protocol. One method
 call replaces ~50 lines of per-bot `_send_dm` boilerplate (NIP-04 encode + p-tag +
-expiration vs `client.send_private_msg`, plus the kind 10050 lookup for proactive
+expiration vs building and sending a gift wrap, plus the kind 10050 lookup for proactive
 sends).
 
 **Why it matters.** If a user reaches you via NIP-04 (legacy clients still common),
@@ -481,7 +513,8 @@ payer = LnurlPayer(
 connected client. Returns a `PublishResult` so you can detect partial / total
 publish failure instead of inferring from log lines.
 
-**Why it matters.** A bare `client.send_event_builder(EventBuilder(Kind(1), ...))`
+**Why it matters.** A bare `EventBuilder(Kind(1), ...).finalize_async(signer)` +
+`client.send_event(...)`
 call works for the simplest case, but the moment you want to **reply**, **quote**,
 **add hashtags**, **set an expiration**, or **know whether any relay actually
 accepted the event**, you're rebuilding the same plumbing. Three specific gotchas:
@@ -571,7 +604,7 @@ that honor NIP-23 will replace the prior version.
 lifetime of a script. Use it when you don't need the full `NostrBot` runtime (no
 DMs, no zaps, no event loop) — just publishing.
 
-**Why it matters.** A naive `Client(NostrSigner.keys(keys))` per cron invocation
+**Why it matters.** A naive `Client()` + relay setup per cron invocation
 adds + connects + disconnects relays every time. If you run hourly, that's 24
 connect/disconnect cycles per day per script. `Publisher` lets you open and close
 the client once around the entire publish set, and exposes the underlying client
@@ -652,7 +685,29 @@ The library does the dance for you.
 
 ## Versions
 
-- **v0.5.1** (current) — lifecycle fix.
+- **v0.5.2** (current) — NIP-40 expiration on gift wraps; nostr-sdk 0.45 upgrade.
+  - **Gift-wrapped DMs now actually expire.** The NIP-40 tag was only ever
+    placed inside the rumor, which a relay cannot read — so nothing was
+    garbage-collected and gift wraps accumulated forever. `send_dm` now stamps
+    the *same* expiration on both the rumor and the outer wrap, so the
+    recipient and the relay agree on when the message dies.
+  - **The shared timestamp is backdated** (new `dm_expiration_tag`) to
+    `now - r` for r in `[0, min(2 days, expiry/4)]`. A plain `now + 7d` would
+    let any observer recover the real send time as `expiration - 7d` and undo
+    the `created_at` randomization NIP-59 exists to provide. At least three
+    quarters of the configured lifetime always survives, and the wrap is never
+    created already expired. Expiries at or below the 2-day gift-wrap window
+    log a warning.
+  - **Dependency**: `nostr-sdk` moved from `==0.44.2` to `>=0.45.0a7,<0.46`
+    (0.45 is where the expiration API landed). Breaking upstream changes
+    absorbed: `Client` no longer holds a signer, `send_event_builder` /
+    `send_private_msg*` / `set_metadata` / `fetch_metadata` / `TagKind` /
+    the `HandleNotification` trait are all gone, filters are wrapped in
+    `ReqTarget`, and notifications are a pull stream.
+  - **Breaking (ours)**: `send_note` / `send_article` take a required
+    `signer=` keyword — the client can no longer sign on their behalf.
+    `NostrBot.post_note` / `Publisher.post_note` are unaffected.
+- **v0.5.1** — lifecycle fix.
   - `run()` no longer re-calls `start()` on an already-started bot, so the
     `await bot.start()` → publish → `await bot.run()` sequence works instead
     of raising `RuntimeError` after the bot is already connected. A genuine

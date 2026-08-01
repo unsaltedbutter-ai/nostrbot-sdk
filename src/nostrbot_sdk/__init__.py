@@ -29,14 +29,16 @@ Public API:
     - DEFAULT_FEE_POLICY, DEFAULT_ZAP_RELAYS: sensible defaults
 
   Helpers:
-    - expiration_tag: NIP-40 helper (default 7 days)
+    - expiration_tag: NIP-40 helper for plain events (default 7 days)
+    - dm_expiration_tag: NIP-40 helper for NIP-17 DMs; one tag for both
+      the rumor and its gift wrap, backdated so it can't leak send time
     - Dedup, UserLockManager: internal building blocks, exposed for advanced use
 """
 
 from nostrbot_sdk.bot import NostrBot, NostrBotConfig
 from nostrbot_sdk.context import SenderContext
 from nostrbot_sdk.dedup import Dedup
-from nostrbot_sdk.expiration import expiration_tag
+from nostrbot_sdk.expiration import dm_expiration_tag, expiration_tag
 from nostrbot_sdk.identity import Identity, IdentityResolver
 from nostrbot_sdk.locks import UserLockManager
 from nostrbot_sdk.nip17_support import Nip17Support
@@ -93,6 +95,7 @@ __all__ = [
     "build_article_tags",
     "build_note_tags",
     "expiration_tag",
+    "dm_expiration_tag",
     "normalize_hashtag",
     "send_article",
     "send_note",

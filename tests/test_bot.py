@@ -14,9 +14,9 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from nostr_sdk import Keys, PublicKey
+from nostr_sdk import ClientNotification, Keys, PublicKey, UnwrappedGift
 
-from nostrbot_sdk.bot import NostrBot, NostrBotConfig, _NotifyBridge
+from nostrbot_sdk.bot import NostrBot, NostrBotConfig
 from nostrbot_sdk.zap_verify import ValidatedZap
 
 
@@ -42,15 +42,25 @@ def _stub_client_methods(bot: NostrBot) -> None:
 
     Leaves the real Client/Signer objects in place so anything that holds a
     reference to them (Nip17Support, IdentityResolver) still works.
+
+    nostr-sdk >=0.45 funnels every publish through send_event, so these tests
+    tell NIP-04 from NIP-17 by the kind of the event handed to it (_sent_kinds)
+    rather than by which client method was called.
     """
-    bot._client.send_private_msg = AsyncMock()
-    bot._client.send_private_msg_to = AsyncMock()
-    bot._client.send_event_builder = AsyncMock()
+    bot._client.send_event = AsyncMock()
     bot._client.add_relay = AsyncMock(return_value=False)
     bot._client.connect = AsyncMock()
     bot._signer.nip04_encrypt = AsyncMock(return_value="<ciphertext>")
     # Default: recipient has no kind 10050 (tests override per-case).
     bot._nip17_support.check = AsyncMock(return_value=None)
+
+
+def _sent_kinds(bot: NostrBot) -> list[int]:
+    """Kinds of every event handed to client.send_event."""
+    return [
+        call.args[0].kind().as_u16()
+        for call in bot._client.send_event.await_args_list
+    ]
 
 
 @pytest.fixture
@@ -220,15 +230,17 @@ def test_on_heartbeat_rejects_nonpositive_interval() -> None:
 
 async def test_send_dm_known_nip17_delivers_to_inbox_relays(bot, other_pk_hex) -> None:
     """NIP-17 repliers get their kind 10050 inbox relays looked up: without
-    gossip, send_private_msg would only publish to OUR pool."""
+    gossip, a broadcast would only publish to OUR pool."""
     bot._set_user_protocol(other_pk_hex, "nip17")
     bot._nip17_support.check = AsyncMock(return_value=["wss://inbox.example/"])
     bot._client.add_relay = AsyncMock(return_value=True)
     ok = await bot.send_dm(other_pk_hex, "hello")
     assert ok is True
     bot._nip17_support.check.assert_awaited_once_with(other_pk_hex)
-    bot._client.send_private_msg_to.assert_awaited_once()
-    bot._client.send_event_builder.assert_not_awaited()
+    assert _sent_kinds(bot) == [1059]
+    # Inbox relays were joined before sending, not left to our own pool.
+    bot._client.add_relay.assert_awaited_once()
+    bot._client.connect.assert_awaited()
 
 
 async def test_send_dm_known_nip17_no_10050_broadcasts_own_pool(bot, other_pk_hex) -> None:
@@ -237,16 +249,16 @@ async def test_send_dm_known_nip17_no_10050_broadcasts_own_pool(bot, other_pk_he
     bot._set_user_protocol(other_pk_hex, "nip17")
     ok = await bot.send_dm(other_pk_hex, "hello")
     assert ok is True
-    bot._client.send_private_msg.assert_awaited_once()
-    bot._client.send_event_builder.assert_not_awaited()
+    assert _sent_kinds(bot) == [1059]
+    # No 10050 means no inbox relays to join: it goes to our pool as-is.
+    bot._client.add_relay.assert_not_awaited()
 
 
 async def test_send_dm_known_nip04_sends_kind_4_event(bot, other_pk_hex) -> None:
     bot._set_user_protocol(other_pk_hex, "nip04")
     ok = await bot.send_dm(other_pk_hex, "hello")
     assert ok is True
-    bot._client.send_event_builder.assert_awaited_once()
-    bot._client.send_private_msg.assert_not_awaited()
+    assert _sent_kinds(bot) == [4]
     bot._signer.nip04_encrypt.assert_awaited_once()
 
 
@@ -255,21 +267,81 @@ async def test_send_dm_unknown_protocol_checks_kind_10050(bot, other_pk_hex) -> 
     bot._client.add_relay = AsyncMock(return_value=True)
     await bot.send_dm(other_pk_hex, "hi")
     bot._nip17_support.check.assert_awaited_once_with(other_pk_hex)
-    bot._client.send_private_msg_to.assert_awaited_once()
+    assert _sent_kinds(bot) == [1059]
     bot._client.connect.assert_awaited()
 
 
 async def test_send_dm_unknown_protocol_falls_back_to_nip04(bot, other_pk_hex) -> None:
     bot._nip17_support.check = AsyncMock(return_value=None)
     await bot.send_dm(other_pk_hex, "hi")
-    bot._client.send_event_builder.assert_awaited_once()
-    bot._client.send_private_msg_to.assert_not_awaited()
+    assert _sent_kinds(bot) == [4]
+
+
+# -- send_dm: NIP-40 expiration on gift wraps ----------------------------------
+
+
+async def test_nip17_dm_carries_same_expiration_inside_and_outside_wrap(bot) -> None:
+    """The point of the nostr-sdk 0.45 upgrade.
+
+    A relay only ever sees the outer gift wrap, so an expiration tag that lives
+    only in the rumor is invisible to it and nothing is ever garbage-collected.
+    Both layers must carry the tag, and they must agree -- otherwise the relay
+    and the recipient disagree about when the message dies.
+    """
+    recipient = Keys.generate()
+    recipient_hex = recipient.public_key().to_hex()
+    bot._set_user_protocol(recipient_hex, "nip17")
+
+    assert await bot.send_dm(recipient_hex, "hello") is True
+
+    wrap = bot._client.send_event.await_args.args[0]
+    assert wrap.kind().as_u16() == 1059
+    outer = wrap.tags().expiration()
+    assert outer is not None, "relay-visible expiration missing from the wrap"
+
+    unwrapped = await UnwrappedGift.from_gift_wrap_async(recipient, wrap)
+    inner = unwrapped.rumor().tags().expiration()
+    assert inner is not None, "recipient-visible expiration missing from the rumor"
+    assert inner.as_secs() == outer.as_secs()
+
+
+async def test_nip17_wrap_expiration_does_not_leak_real_send_time(bot) -> None:
+    """The shared timestamp is backdated, so `expiration - dm_expiry_seconds`
+    must not hand an observer the real send time back."""
+    recipient = Keys.generate()
+    bot._set_user_protocol(recipient.public_key().to_hex(), "nip17")
+    now = int(time.time())
+
+    await bot.send_dm(recipient.public_key().to_hex(), "hello")
+
+    wrap = bot._client.send_event.await_args.args[0]
+    implied_send_time = (
+        wrap.tags().expiration().as_secs() - bot._config.dm_expiry_seconds
+    )
+    assert implied_send_time <= now
+    # Still bounded: at least three quarters of the lifetime survives.
+    assert wrap.tags().expiration().as_secs() > now
+
+
+async def test_nip04_dm_carries_plain_absolute_expiration(bot, other_pk_hex) -> None:
+    """Kind 4 has no wrap to hide behind: its created_at is already the real
+    send time, so the expiry is a plain now + dm_expiry_seconds."""
+    bot._set_user_protocol(other_pk_hex, "nip04")
+    now = int(time.time())
+
+    await bot.send_dm(other_pk_hex, "hello")
+
+    event = bot._client.send_event.await_args.args[0]
+    assert event.kind().as_u16() == 4
+    expiration = event.tags().expiration()
+    assert expiration is not None
+    assert expiration.as_secs() >= now + bot._config.dm_expiry_seconds - 5
 
 
 async def test_send_dm_swallows_exceptions_and_returns_false(bot, other_pk_hex) -> None:
     """A failing send_dm must not propagate; it logs and returns False."""
     bot._set_user_protocol(other_pk_hex, "nip17")
-    bot._client.send_private_msg = AsyncMock(side_effect=RuntimeError("relay error"))
+    bot._client.send_event = AsyncMock(side_effect=RuntimeError("relay error"))
     ok = await bot.send_dm(other_pk_hex, "hi")
     assert ok is False
 
@@ -477,14 +549,23 @@ async def test_zap_receipt_replay_is_ignored(other_pk_hex) -> None:
     assert credited == ["cc" * 32]
 
 
-# -- _NotifyBridge: in-flight task tracking --------------------------------------
+# -- _notification_loop: in-flight task tracking ---------------------------------
 
 
-async def test_notify_bridge_tracks_inflight_tasks(bot) -> None:
+def _new_event_notification(event=None):
+    return ClientNotification.NEW_EVENT(MagicMock(), "sub", event or MagicMock())
+
+
+def _stream(*notifications):
+    """Fake ClientNotificationStream: yields each item, then terminates."""
+    stream = MagicMock()
+    stream.next = AsyncMock(side_effect=[*notifications, None])
+    return stream
+
+
+async def test_notification_loop_tracks_inflight_tasks(bot) -> None:
     """Handler tasks must be strongly referenced (asyncio only keeps weak
     refs) and discarded from the set once done."""
-    bridge = _NotifyBridge(bot)
-
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -493,7 +574,9 @@ async def test_notify_bridge_tracks_inflight_tasks(bot) -> None:
         await release.wait()
 
     bot._handle_event = slow_handler  # type: ignore[assignment]
-    await bridge.handle(MagicMock(), "sub", MagicMock())
+    loop_task = asyncio.create_task(
+        bot._notification_loop(_stream(_new_event_notification())),
+    )
     await asyncio.wait_for(started.wait(), timeout=1.0)
     assert len(bot._inflight) == 1
 
@@ -502,6 +585,26 @@ async def test_notify_bridge_tracks_inflight_tasks(bot) -> None:
     await task
     await asyncio.sleep(0)  # let the done-callback run
     assert len(bot._inflight) == 0
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+
+async def test_notification_loop_ignores_non_event_notifications(bot) -> None:
+    """Only NEW_EVENT spawns a handler; MESSAGE/SHUTDOWN are skipped."""
+    handled: list[object] = []
+
+    async def handler(event):
+        handled.append(event)
+
+    bot._handle_event = handler  # type: ignore[assignment]
+    stream = _stream(ClientNotification.SHUTDOWN(), _new_event_notification())
+    await asyncio.wait_for(bot._notification_loop(stream), timeout=1.0)
+    await asyncio.gather(*list(bot._inflight))
+    assert len(handled) == 1
+
+
+async def test_notification_loop_exits_when_stream_terminates(bot) -> None:
+    """A None from next() means the client shut down; the loop must return."""
+    await asyncio.wait_for(bot._notification_loop(_stream()), timeout=1.0)
 
 
 async def test_stop_waits_for_inflight_handlers(bot) -> None:

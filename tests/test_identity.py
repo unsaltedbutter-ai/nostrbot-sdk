@@ -12,17 +12,26 @@ PUBKEY = "aa" * 32
 OTHER = "bb" * 32
 
 
-def _meta_mock(data: dict | None) -> MagicMock | None:
+def _events_mock(data: dict | None) -> MagicMock:
+    """Fake nostr_sdk.Events: empty when data is None, else one kind 0 event.
+
+    Must be a MagicMock (not AsyncMock): is_empty/first/content are sync.
+    """
+    events = MagicMock()
     if data is None:
-        return None
-    m = MagicMock()
-    m.as_json.return_value = json.dumps(data)
-    return m
+        events.is_empty.return_value = True
+        events.first.return_value = None
+        return events
+    events.is_empty.return_value = False
+    event = MagicMock()
+    event.content.return_value = json.dumps(data)
+    events.first.return_value = event
+    return events
 
 
 async def test_returns_full_identity_on_kind_0_hit() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({
+    client.fetch_events.return_value = _events_mock({
         "name": "alice",
         "display_name": "Alice",
         "picture": "https://x/avatar.png",
@@ -43,7 +52,7 @@ async def test_returns_full_identity_on_kind_0_hit() -> None:
 
 async def test_returns_minimal_identity_when_no_kind_0() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = None
+    client.fetch_events.return_value = _events_mock(None)
     resolver = IdentityResolver(client)
     ident = await resolver.resolve(PUBKEY)
     assert ident.pubkey_hex == PUBKEY
@@ -53,7 +62,7 @@ async def test_returns_minimal_identity_when_no_kind_0() -> None:
 
 async def test_returns_minimal_identity_on_fetch_error() -> None:
     client = AsyncMock()
-    client.fetch_metadata.side_effect = RuntimeError("relay timeout")
+    client.fetch_events.side_effect = RuntimeError("relay timeout")
     resolver = IdentityResolver(client)
     ident = await resolver.resolve(PUBKEY)
     assert ident.pubkey_hex == PUBKEY
@@ -62,54 +71,54 @@ async def test_returns_minimal_identity_on_fetch_error() -> None:
 
 async def test_caches_positive_result() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    client.fetch_events.return_value = _events_mock({"name": "alice"})
     resolver = IdentityResolver(client)
     await resolver.resolve(PUBKEY)
     await resolver.resolve(PUBKEY)
-    client.fetch_metadata.assert_awaited_once()
+    client.fetch_events.assert_awaited_once()
 
 
 async def test_caches_negative_result() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = None
+    client.fetch_events.return_value = _events_mock(None)
     resolver = IdentityResolver(client)
     await resolver.resolve(PUBKEY)
     await resolver.resolve(PUBKEY)
-    client.fetch_metadata.assert_awaited_once()
+    client.fetch_events.assert_awaited_once()
 
 
 async def test_cache_expires_after_ttl() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    client.fetch_events.return_value = _events_mock({"name": "alice"})
     resolver = IdentityResolver(client, ttl_seconds=0.01)
     await resolver.resolve(PUBKEY)
     await asyncio.sleep(0.02)
     await resolver.resolve(PUBKEY)
-    assert client.fetch_metadata.await_count == 2
+    assert client.fetch_events.await_count == 2
 
 
 async def test_different_pubkeys_cached_separately() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": "x"})
+    client.fetch_events.return_value = _events_mock({"name": "x"})
     resolver = IdentityResolver(client)
     await resolver.resolve(PUBKEY)
     await resolver.resolve(OTHER)
-    assert client.fetch_metadata.await_count == 2
+    assert client.fetch_events.await_count == 2
 
 
 async def test_invalidate_forces_refetch() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    client.fetch_events.return_value = _events_mock({"name": "alice"})
     resolver = IdentityResolver(client)
     await resolver.resolve(PUBKEY)
     resolver.invalidate(PUBKEY)
     await resolver.resolve(PUBKEY)
-    assert client.fetch_metadata.await_count == 2
+    assert client.fetch_events.await_count == 2
 
 
 async def test_cleanup_expired_removes_old_entries() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = None
+    client.fetch_events.return_value = _events_mock(None)
     resolver = IdentityResolver(client, ttl_seconds=0.01)
     await resolver.resolve(PUBKEY)
     assert len(resolver._cache) == 1
@@ -121,7 +130,7 @@ async def test_cleanup_expired_removes_old_entries() -> None:
 
 async def test_empty_string_fields_become_none() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({
+    client.fetch_events.return_value = _events_mock({
         "name": "",
         "display_name": "   ",
         "lud16": "alice@unsaltedbutter.ai",
@@ -135,7 +144,7 @@ async def test_empty_string_fields_become_none() -> None:
 
 async def test_non_string_fields_become_none() -> None:
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": 42, "lud16": None})
+    client.fetch_events.return_value = _events_mock({"name": 42, "lud16": None})
     resolver = IdentityResolver(client)
     ident = await resolver.resolve(PUBKEY)
     assert ident.name is None
@@ -161,26 +170,26 @@ async def test_fetch_error_not_cached_retries_next_call() -> None:
     """A fetch failure returns a minimal Identity but must not be cached:
     the next resolve() should retry the network."""
     client = AsyncMock()
-    client.fetch_metadata.side_effect = RuntimeError("relay timeout")
+    client.fetch_events.side_effect = RuntimeError("relay timeout")
     resolver = IdentityResolver(client)
 
     ident = await resolver.resolve(PUBKEY)
     assert ident.name is None
 
-    client.fetch_metadata.side_effect = None
-    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    client.fetch_events.side_effect = None
+    client.fetch_events.return_value = _events_mock({"name": "alice"})
     ident = await resolver.resolve(PUBKEY)
     assert ident.name == "alice"
-    assert client.fetch_metadata.await_count == 2
+    assert client.fetch_events.await_count == 2
 
 
 async def test_fetch_error_serves_stale_entry() -> None:
     """An expired cached Identity is served when the refresh fetch fails."""
     client = AsyncMock()
-    client.fetch_metadata.return_value = _meta_mock({"name": "alice"})
+    client.fetch_events.return_value = _events_mock({"name": "alice"})
     resolver = IdentityResolver(client, ttl_seconds=0.0)  # everything expires
 
     assert (await resolver.resolve(PUBKEY)).name == "alice"
 
-    client.fetch_metadata.side_effect = RuntimeError("relay down")
+    client.fetch_events.side_effect = RuntimeError("relay down")
     assert (await resolver.resolve(PUBKEY)).name == "alice"

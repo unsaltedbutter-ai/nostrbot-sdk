@@ -35,11 +35,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from nostr_sdk import (
+    AsyncNostrSigner,
     Client,
     EventBuilder,
     Keys,
     Kind,
-    NostrSigner,
     PublicKey,
     RelayUrl,
     Tag,
@@ -229,6 +229,7 @@ async def send_note(
     client: Client,
     content: str,
     *,
+    signer: AsyncNostrSigner,
     reply_to: str | None = None,
     reply_root: str | None = None,
     reply_to_author: str | None = None,
@@ -239,7 +240,11 @@ async def send_note(
     expiration_seconds: int | None = None,
     extra_tags: list[Tag] | None = None,
 ) -> PublishResult:
-    """Publish a kind 1 note using `client`. Returns PublishResult."""
+    """Publish a kind 1 note using `client`, signed with `signer`.
+
+    `signer` is required because nostr-sdk >=0.45 clients no longer hold one.
+    Returns PublishResult.
+    """
     tags = build_note_tags(
         reply_to=reply_to,
         reply_root=reply_root,
@@ -252,7 +257,7 @@ async def send_note(
         extra_tags=extra_tags,
     )
     builder = EventBuilder(Kind(1), content).tags(tags)
-    return await _send(client, builder, kind=1)
+    return await _send(client, signer, builder, kind=1)
 
 
 async def send_article(
@@ -260,6 +265,7 @@ async def send_article(
     title: str,
     content: str,
     *,
+    signer: AsyncNostrSigner,
     identifier: str,
     summary: str | None = None,
     image: str | None = None,
@@ -267,7 +273,11 @@ async def send_article(
     published_at: int | None = None,
     extra_tags: list[Tag] | None = None,
 ) -> PublishResult:
-    """Publish a NIP-23 long-form article (kind 30023). Returns PublishResult."""
+    """Publish a NIP-23 long-form article (kind 30023), signed with `signer`.
+
+    `signer` is required because nostr-sdk >=0.45 clients no longer hold one.
+    Returns PublishResult.
+    """
     tags = build_article_tags(
         identifier=identifier,
         title=title,
@@ -278,11 +288,19 @@ async def send_article(
         extra_tags=extra_tags,
     )
     builder = EventBuilder(Kind(30023), content).tags(tags)
-    return await _send(client, builder, kind=30023)
+    return await _send(client, signer, builder, kind=30023)
 
 
-async def _send(client: Client, builder: EventBuilder, *, kind: int) -> PublishResult:
-    output = await client.send_event_builder(builder)
+async def _send(
+    client: Client,
+    signer: AsyncNostrSigner,
+    builder: EventBuilder,
+    *,
+    kind: int,
+) -> PublishResult:
+    # nostr-sdk >=0.45 removed send_event_builder: sign first, then send.
+    event = await builder.finalize_async(signer)
+    output = await client.send_event(event)
     event_id_hex = output.id.to_hex()
     note_id = output.id.to_bech32()
     success_relays = [str(r) for r in output.success]
@@ -327,8 +345,9 @@ class Publisher:
 
     def __init__(self, keys: Keys, relays: list[str]) -> None:
         self._keys = keys
-        self._signer = NostrSigner.keys(keys)
-        self._client = Client(self._signer)
+        # nostr-sdk >=0.45: Keys is itself a signer and Client takes none.
+        self._signer = keys
+        self._client = Client()
         self._relays = list(relays)
         self._connected = False
 
@@ -372,7 +391,9 @@ class Publisher:
         await self.disconnect()
 
     async def post_note(self, content: str, **kw) -> PublishResult:
-        return await send_note(self._client, content, **kw)
+        return await send_note(self._client, content, signer=self._signer, **kw)
 
     async def post_article(self, title: str, content: str, **kw) -> PublishResult:
-        return await send_article(self._client, title, content, **kw)
+        return await send_article(
+            self._client, title, content, signer=self._signer, **kw,
+        )

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from nostr_sdk import PublicKey
+from nostr_sdk import Filter, Kind, PublicKey, ReqTarget
 
 if TYPE_CHECKING:
     from nostr_sdk import Client
@@ -103,10 +103,14 @@ class IdentityResolver:
     async def _fetch(self, pubkey_hex: str) -> Identity:
         """Fetch and parse kind 0. Raises on fetch/parse errors."""
         pk = PublicKey.parse(pubkey_hex)
-        meta = await self._client.fetch_metadata(pk, self._fetch_timeout)
-        if meta is None:
+        # nostr-sdk >=0.45 dropped Client.fetch_metadata; query kind 0 directly.
+        f = Filter().kind(Kind(0)).author(pk).limit(1)
+        events = await self._client.fetch_events(
+            ReqTarget.auto([f]), self._fetch_timeout,
+        )
+        if events.is_empty():
             return Identity(pubkey_hex=pubkey_hex)
-        data = json.loads(meta.as_json())
+        data = json.loads(events.first().content())
         return Identity(
             pubkey_hex=pubkey_hex,
             name=_clean(data.get("name")),

@@ -52,7 +52,7 @@ except ImportError as e:
         "Install with: pip install 'nostrbot-sdk[lnurl]'"
     ) from e
 
-from nostr_sdk import EventBuilder, Kind, PublicKey, Tag, TagKind
+from nostr_sdk import EventBuilder, Kind, PublicKey, Tag
 
 if TYPE_CHECKING:
     from nostr_sdk import Keys
@@ -216,10 +216,12 @@ def create_zap_request(
         EventBuilder(Kind(9734), comment)
         .tags([
             Tag.public_key(PublicKey.parse(recipient_hex)),
-            Tag.custom(TagKind.AMOUNT(), [str(amount_msats)]),
-            Tag.custom(TagKind.RELAYS(), relays),
+            # nostr-sdk >=0.45 dropped TagKind; custom() takes a plain string
+            # and sign_with_keys() became finalize().
+            Tag.custom("amount", [str(amount_msats)]),
+            Tag.custom("relays", relays),
         ])
-        .sign_with_keys(bot_keys)
+        .finalize(bot_keys)
     )
     return event.as_json()
 

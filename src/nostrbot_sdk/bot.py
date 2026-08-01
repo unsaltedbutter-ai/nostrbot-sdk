@@ -45,27 +45,28 @@ from typing import Any
 
 from nostr_sdk import (
     Client,
+    ClientNotification,
     Event,
     EventBuilder,
     Filter,
-    HandleNotification,
     Keys,
     Kind,
     KindStandard,
     Metadata,
-    NostrSigner,
     PublicKey,
-    RelayMessage,
     RelayUrl,
+    ReqTarget,
+    SendEventTarget,
     Tag,
     Timestamp,
     UnwrappedGift,
     nip04_decrypt,
+    nip59_make_gift_wrap_async,
 )
 
 from nostrbot_sdk.context import SenderContext
 from nostrbot_sdk.dedup import Dedup
-from nostrbot_sdk.expiration import expiration_tag
+from nostrbot_sdk.expiration import dm_expiration_tag, expiration_tag
 from nostrbot_sdk.identity import IdentityResolver
 from nostrbot_sdk.locks import UserLockManager
 from nostrbot_sdk.nip17_support import Nip17Support
@@ -170,8 +171,10 @@ class NostrBot:
     def __init__(self, config: NostrBotConfig) -> None:
         self._config = config
         self._keys = Keys.parse(config.nsec)
-        self._signer = NostrSigner.keys(self._keys)
-        self._client = Client(self._signer)
+        # nostr-sdk >=0.45: Keys implements the signer traits directly and the
+        # Client no longer holds a signer -- events are signed before sending.
+        self._signer = self._keys
+        self._client = Client()
         self._pubkey_hex = self._keys.public_key().to_hex()
 
         self._dedup_event: Dedup[str] = Dedup(
@@ -227,7 +230,7 @@ class NostrBot:
         return self._keys
 
     @property
-    def signer(self) -> NostrSigner:
+    def signer(self) -> Keys:
         return self._signer
 
     @property
@@ -305,11 +308,14 @@ class NostrBot:
           2. Otherwise consult their kind 10050. If found, NIP-17 to those
              inbox relays (added permanently to the pool to avoid TIME_WAIT
              socket churn). This applies to NIP-17 repliers too: without
-             gossip, `send_private_msg` would publish only to OUR relay
+             gossip, a plain broadcast would publish only to OUR relay
              pool, which the recipient may never read.
           3. If they reached us via NIP-17 but no 10050 is found right now,
              best-effort NIP-17 to our own pool.
           4. Fall back to NIP-04.
+
+        NIP-17 sends carry a NIP-40 expiration on both the rumor and the gift
+        wrap (see `_build_gift_wrap`); NIP-04 sends carry a plain one.
 
         Returns True if the send succeeded, False if it failed (errors are
         logged, never raised).
@@ -317,10 +323,9 @@ class NostrBot:
         try:
             pk = PublicKey.parse(recipient_hex)
             protocol = self._get_user_protocol(recipient_hex)
-            exp = expiration_tag(self._config.dm_expiry_seconds)
 
             if protocol == "nip04":
-                await self._send_nip04(pk, text, exp)
+                await self._send_nip04(pk, text)
                 log.info("Sent nip04 DM to %s (%d chars)", recipient_hex[:16], len(text))
                 return True
 
@@ -333,8 +338,9 @@ class NostrBot:
                         added.append(ru)
                 if added:
                     await self._client.connect()
-                await self._client.send_private_msg_to(
-                    relay_urls, pk, text, [exp],
+                wrap = await self._build_gift_wrap(pk, text)
+                await self._client.send_event(
+                    wrap, target=SendEventTarget.to(relay_urls),
                 )
                 log.info(
                     "Sent nip17 DM to %s (%d chars, %d inbox relays)",
@@ -344,13 +350,16 @@ class NostrBot:
                 # They DM'd us via NIP-17 so they do support it, but we can't
                 # find their inbox relays right now. Best effort: gift wrap
                 # to our own pool and hope for relay overlap.
-                await self._client.send_private_msg(pk, text, [exp])
+                wrap = await self._build_gift_wrap(pk, text)
+                await self._client.send_event(
+                    wrap, target=SendEventTarget.broadcast(),
+                )
                 log.info(
                     "Sent nip17 DM to %s (%d chars, own pool; no kind 10050 found)",
                     recipient_hex[:16], len(text),
                 )
             else:
-                await self._send_nip04(pk, text, exp)
+                await self._send_nip04(pk, text)
                 log.info(
                     "Sent nip04 DM to %s (%d chars, fallback)",
                     recipient_hex[:16], len(text),
@@ -359,6 +368,29 @@ class NostrBot:
         except Exception:
             log.exception("Failed to send DM to %s", recipient_hex[:16])
             return False
+
+    async def _build_gift_wrap(self, pk: PublicKey, text: str) -> Event:
+        """Build a NIP-17 gift wrap carrying one expiration tag in both layers.
+
+        The rumor gets the tag so the recipient's client knows when the message
+        expires; the outer wrap gets the *same* tag so relays -- which can only
+        see the wrap -- garbage-collect it at the same moment. A tag on the
+        rumor alone is invisible to relays and collects nothing.
+
+        See `dm_expiration_tag` for why the timestamp is backdated rather than
+        being a plain `now + dm_expiry_seconds`.
+        """
+        exp = dm_expiration_tag(self._config.dm_expiry_seconds)
+        rumor = (
+            EventBuilder(
+                Kind.from_std(KindStandard.PRIVATE_DIRECT_MESSAGE), text,
+            )
+            .tags([Tag.public_key(pk), exp])
+            .finalize_unsigned(self._keys.public_key())
+        )
+        return await nip59_make_gift_wrap_async(
+            self._signer, pk, rumor, expiration=None, extra_tags=[exp],
+        )
 
     def _set_user_protocol(self, sender_hex: str, protocol: str) -> None:
         self._user_protocol[sender_hex] = (protocol, time.monotonic())
@@ -384,13 +416,19 @@ class NostrBot:
             del self._user_protocol[k]
         return len(stale)
 
-    async def _send_nip04(self, pk: PublicKey, text: str, exp_tag: Tag) -> None:
+    async def _send_nip04(self, pk: PublicKey, text: str) -> None:
+        # No gift wrap here: a kind 4's created_at is the real send time, so a
+        # plain absolute expiry leaks nothing that the event doesn't already say.
         ciphertext = await self._signer.nip04_encrypt(pk, text)
-        builder = EventBuilder(Kind(4), ciphertext).tags([
-            Tag.parse(["p", pk.to_hex()]),
-            exp_tag,
-        ])
-        await self._client.send_event_builder(builder)
+        event = await (
+            EventBuilder(Kind(4), ciphertext)
+            .tags([
+                Tag.public_key(pk),
+                expiration_tag(self._config.dm_expiry_seconds),
+            ])
+            .finalize_async(self._signer)
+        )
+        await self._client.send_event(event)
 
     # -- Publishing (kind 1 notes and kind 30023 long-form articles) ---------
 
@@ -402,7 +440,7 @@ class NostrBot:
         quote_author, mention_pubkeys, hashtags, expiration_seconds,
         extra_tags.
         """
-        return await send_note(self._client, content, **kw)
+        return await send_note(self._client, content, signer=self._signer, **kw)
 
     async def post_article(self, title: str, content: str, **kw) -> PublishResult:
         """Publish a NIP-23 long-form article (kind 30023).
@@ -410,9 +448,20 @@ class NostrBot:
         Required kwarg: identifier (the `d`-tag value).
         Optional: summary, image, hashtags, published_at, extra_tags.
         """
-        return await send_article(self._client, title, content, **kw)
+        return await send_article(
+            self._client, title, content, signer=self._signer, **kw,
+        )
 
     # -- Lifecycle -------------------------------------------------------------
+
+    async def _publish(self, builder: EventBuilder) -> None:
+        """Sign a builder with the bot's keys and broadcast it to the pool.
+
+        nostr-sdk >=0.45 removed Client.send_event_builder; the client has no
+        signer of its own, so events are finalized here before sending.
+        """
+        event = await builder.finalize_async(self._signer)
+        await self._client.send_event(event)
 
     async def start(self) -> None:
         """Connect to relays, publish profile/relay lists, subscribe.
@@ -434,28 +483,27 @@ class NostrBot:
         log.info("Connected to %d relay(s)", len(self._config.relays))
 
         # 2. Publish kind 0 (Metadata) if profile is non-empty.
+        #    nostr-sdk >=0.45 dropped Client.set_metadata and the EventBuilder
+        #    kind constructors, so these three are built by hand.
         if self._config.publish_kind_0 and self._config.profile:
             metadata = Metadata.from_json(json.dumps(self._config.profile))
-            await self._client.set_metadata(metadata)
+            await self._publish(EventBuilder(Kind(0), metadata.as_json()))
             log.info("Published kind 0 profile")
 
         # 3. Publish kind 10002 (NIP-65 relay list).
         if self._config.publish_kind_10002:
-            relay_map = {RelayUrl.parse(r): None for r in self._config.relays}
-            await self._client.send_event_builder(
-                EventBuilder.relay_list(relay_map),
-            )
+            # NIP-65: ["r", <url>] with no marker means read+write.
+            relay_tags = [Tag.parse(["r", r]) for r in self._config.relays]
+            await self._publish(EventBuilder(Kind(10002), "").tags(relay_tags))
             log.info(
-                "Published kind 10002 relay list (%d relays)", len(relay_map),
+                "Published kind 10002 relay list (%d relays)", len(relay_tags),
             )
 
         # 4. Publish kind 10050 (NIP-17 DM inbox list).
         if self._config.publish_kind_10050:
             inbox = self._config.relays[: self._config.inbox_relay_count]
             inbox_tags = [Tag.parse(["relay", r]) for r in inbox]
-            await self._client.send_event_builder(
-                EventBuilder(Kind(10050), "").tags(inbox_tags),
-            )
+            await self._publish(EventBuilder(Kind(10050), "").tags(inbox_tags))
             log.info("Published kind 10050 DM inbox list (%d relays)", len(inbox))
 
         # 5. Subscribe.
@@ -477,14 +525,16 @@ class NostrBot:
             .kind(Kind.from_std(KindStandard.GIFT_WRAP))
             .limit(0)
         )
-        # Start consuming notifications BEFORE subscribing so events that
-        # arrive immediately after the subscription are not dropped.
+        # Open the notification stream BEFORE subscribing: notifications()
+        # only delivers what arrives after the call, so subscribing first
+        # would race and drop the earliest events.
+        notifications = self._client.notifications()
         self._tasks.append(asyncio.create_task(
-            self._client.handle_notifications(_NotifyBridge(self)),
+            self._notification_loop(notifications),
             name="nostrbot_notifications",
         ))
-        await self._client.subscribe(f_legacy)
-        await self._client.subscribe(f_giftwrap)
+        await self._client.subscribe(ReqTarget.auto([f_legacy]))
+        await self._client.subscribe(ReqTarget.auto([f_giftwrap]))
         log.info("Subscribed to kind 4, 1059, 9735")
 
         # 6. Background tasks.
@@ -588,7 +638,7 @@ class NostrBot:
     # -- Event dispatch --------------------------------------------------------
 
     async def _handle_event(self, event: Event) -> None:
-        """Route an inbound event. Called by _NotifyBridge per nostr-sdk event."""
+        """Route an inbound event. Called by _notification_loop per event."""
         eid = event.id().to_hex()
         if self._dedup_event.check_and_add(eid):
             log.debug("Skipping duplicate event %s", eid[:16])
@@ -625,7 +675,9 @@ class NostrBot:
 
     async def _handle_nip17_dm(self, event: Event) -> None:
         try:
-            unwrapped = await UnwrappedGift.from_gift_wrap(self._signer, event)
+            unwrapped = await UnwrappedGift.from_gift_wrap_async(
+                self._signer, event,
+            )
         except Exception:
             log.warning("Failed to unwrap NIP-17 gift wrap")
             return
@@ -799,25 +851,30 @@ class NostrBot:
             raise
 
 
-class _NotifyBridge(HandleNotification):
-    """Bridge between nostr-sdk's notification system and NostrBot._handle_event.
+    async def _notification_loop(self, notifications) -> None:
+        """Drain the client notification stream into _handle_event.
 
-    Spawns a task per event so unrelated events process in parallel; same-user
-    events serialize via NostrBot's per-user lock. Tasks are tracked in the
-    bot's _inflight set: asyncio holds only weak references to tasks, so an
-    untracked task could be garbage-collected mid-flight, and stop() needs
-    the set to drain handlers gracefully.
-    """
-
-    def __init__(self, bot: NostrBot) -> None:
-        self._bot = bot
-
-    async def handle(
-        self, relay_url: RelayUrl, subscription_id: str, event: Event,
-    ) -> None:
-        task = asyncio.create_task(self._bot._handle_event(event))
-        self._bot._inflight.add(task)
-        task.add_done_callback(self._bot._inflight.discard)
-
-    async def handle_msg(self, relay_url: RelayUrl, msg: RelayMessage) -> None:
-        pass
+        Replaces the HandleNotification trait that nostr-sdk dropped in 0.45.
+        Spawns a task per event so unrelated events process in parallel;
+        same-user events serialize via the per-user lock. Tasks are tracked in
+        _inflight: asyncio holds only weak references to tasks, so an untracked
+        one could be garbage-collected mid-flight, and stop() needs the set to
+        drain handlers gracefully.
+        """
+        try:
+            while True:
+                notification = await notifications.next()
+                if notification is None:
+                    # Stream terminated (client shut down).
+                    return
+                if not isinstance(notification, ClientNotification.NEW_EVENT):
+                    continue
+                task = asyncio.create_task(
+                    self._handle_event(notification.event),
+                )
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Notification loop terminated unexpectedly")

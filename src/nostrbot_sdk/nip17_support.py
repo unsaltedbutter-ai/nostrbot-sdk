@@ -10,8 +10,10 @@ Usage:
     result = await detector.check(recipient_pubkey_hex)
     if result is not None:
         # User supports NIP-17; result is a list of relay URL strings
-        await client.send_private_msg_to(
-            [RelayUrl.parse(r) for r in result], pk, message, []
+        wrap = await nip17_make_private_msg_async(signer, pk, message)
+        await client.send_event(
+            wrap,
+            target=SendEventTarget.to([RelayUrl.parse(r) for r in result]),
         )
     else:
         # Fall back to NIP-04
@@ -26,7 +28,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from nostr_sdk import Filter, Kind, PublicKey
+from nostr_sdk import Filter, Kind, PublicKey, ReqTarget
 
 if TYPE_CHECKING:
     from nostr_sdk import Client
@@ -126,7 +128,11 @@ class Nip17Support:
         """
         pk = PublicKey.parse(pubkey_hex)
         f = Filter().kind(KIND_DM_RELAYS).author(pk).limit(1)
-        events = await self._client.fetch_events(f, FETCH_TIMEOUT)
+        # nostr-sdk >=0.45 takes a ReqTarget rather than a bare Filter;
+        # `auto` keeps the previous behaviour of querying all read relays.
+        events = await self._client.fetch_events(
+            ReqTarget.auto([f]), FETCH_TIMEOUT,
+        )
 
         if events.is_empty():
             return None
