@@ -40,3 +40,20 @@ def test_sender_context_holds_all_fields() -> None:
     assert ctx.sender_hex == "dd" * 32
     assert ctx.sender_npub == "npub1abc"
     assert ctx.protocol == "nip04"
+
+
+def test_event_id_defaults_to_empty_for_backward_compatibility() -> None:
+    ctx = SenderContext("ee" * 32, "npub1abc", "zap", _bot=MagicMock())
+    assert ctx.event_id == ""
+
+
+def test_event_id_accepts_positional_and_keyword_forms() -> None:
+    ctx = SenderContext(
+        "ff" * 32, "npub1abc", "nip17", MagicMock(), "ab" * 32,
+    )
+    assert ctx.event_id == "ab" * 32
+
+    ctx = SenderContext(
+        "ff" * 32, "npub1abc", "nip17", _bot=MagicMock(), event_id="cd" * 32,
+    )
+    assert ctx.event_id == "cd" * 32

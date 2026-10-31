@@ -30,6 +30,11 @@ class SenderContext:
         protocol: how the message arrived. "nip04" or "nip17" for DMs;
             "zap" for zap receipts (where there is no inbound DM and any
             reply uses the protocol-detection fallback via kind 10050).
+        event_id: 64-char hex id of the event that produced the message.
+            For NIP-17 this is the outer gift wrap (the event relays
+            delivered), for NIP-04 the kind-4 event. Empty string when no
+            event id is available (e.g., zap contexts). Stable enough to use
+            as an idempotency key.
 
     Methods:
         reply(text): send a DM back to this sender using the protocol they
@@ -41,6 +46,7 @@ class SenderContext:
     sender_npub: str
     protocol: Protocol
     _bot: NostrBot
+    event_id: str = ""
 
     async def reply(self, text: str) -> bool:
         """Send a DM back using the protocol this sender used.

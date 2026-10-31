@@ -4,10 +4,10 @@ High-level toolkit for building Nostr bots in Python. Handles the protocol plumb
 (DM listening, NIP-17 gift wraps, zap receipt validation, note publishing, LNURL-pay)
 so your bot code can stay focused on what it actually does.
 
-Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (`>=0.45.0a7,<0.46`).
+Built on [`nostr-sdk`](https://pypi.org/project/nostr-sdk/) (`>=0.45.1,<0.46`).
 
-**Status:** **v0.5.2 shipped.** The full runtime, LNURL-pay, and publishing are all
-callable today. 213 tests, MIT licensed. Each feature section below carries a
+**Status:** **v0.6.0 shipped.** The full runtime, LNURL-pay, and publishing are all
+callable today. 233 tests, MIT licensed. Each feature section below carries a
 `(vX.Y.Z)` tag indicating the minimum version it landed in; pin to that or later.
 See [Versions](#versions) for the shipped-when changelog.
 
@@ -98,7 +98,7 @@ async with Publisher.from_nsec(nsec, relays) as pub:
 
 Each section below describes the problem the feature solves and how to use it. The
 `(vX.Y.Z)` tag on each section is the minimum version that needs to be installed for
-the API to be available; everything through v0.4.0 is shipped today.
+the API to be available; everything through v0.6.0 is shipped today.
 
 ### NIP-17 inbox detection with TTL cache (v0.1.0)
 
@@ -681,11 +681,115 @@ cleanly, disconnects from relays, and returns.
 Ungraceful shutdown leaves stale connections on relays and can lose in-flight DMs.
 The library does the dance for you.
 
+### Watchdog stall detection (v0.6.0)
+
+`NostrBotConfig(watchdog_stall_seconds=120)` sets the maximum number of seconds the
+notification loop may go without consuming *any* frame (a new event, EOSE, NOTICE,
+anything the stream yields) before `health_check()` reports the bot unhealthy.
+`None` (the default) disables stall detection and preserves the pre-0.6.0 behavior.
+
+**Why it matters.** Relay sockets can read `CONNECTED` while the notification loop
+has stopped consuming frames — a hung handler, a wedged Rust task, or a stream that
+silently stopped yielding. Without a stall window, "the socket is up" looks healthy
+forever and your bot quietly stops receiving DMs. Measuring time since the last
+*consumed frame* catches the failure the relay status cannot.
+
+**Usage.**
+
+```python
+cfg = NostrBotConfig(
+    nsec="nsec1...",
+    relays=["wss://relay.damus.io"],
+    watchdog_stall_seconds=120,  # no frame for 2 min -> unhealthy
+)
+```
+
+### Health check for supervisors (v0.6.0)
+
+`await bot.health_check() -> bool` returns `True` only when a client exists, the
+notification loop task is alive, at least one relay is in a connectable status
+(`CONNECTED`, `CONNECTING`, `PENDING`, `INITIALIZED`, or `SLEEPING`), and — when
+`watchdog_stall_seconds` is set — a frame was consumed within that window.
+
+**Why it matters.** A supervisor (systemd, launchd, a Kubernetes liveness probe
+shim, or your own watchdog loop) needs one cheap question to ask: "can this bot
+receive events right now?" Inspection failures are reported as `False`, never
+raised, so a transient SDK error reads as "ambiguously unhealthy" instead of
+crashing the supervisor.
+
+**Usage.**
+
+```python
+if not await bot.health_check():
+    log.warning("nostr bot unhealthy; reconnecting")
+    await bot.restart()
+```
+
+### Soft reconnect without metadata storms (v0.6.0)
+
+`await bot.restart()` cancels the notification loop, disconnects the client, waits
+one second for sockets to settle, then re-adds relays, reconnects, and re-subscribes.
+It deliberately does **not** re-publish kind 0, kind 10002, or kind 10050. Calling it
+while stopped performs a clean start instead.
+
+**Why it matters.** Naively calling `stop()` + `start()` on every unhealthy tick
+republishes your profile and relay lists each time. A flapping connection then fans
+out duplicate replaceable events to every relay — a relay storm that can get a bot
+rate-limited or banned. `restart()` reuses the start machinery minus the identity
+publishes, so recovery is cheap and idempotent. It reaps the old loop task before
+starting a new one, so repeated restarts do not leak tasks.
+
+**Usage.**
+
+```python
+while True:
+    await asyncio.sleep(30)
+    if not await bot.health_check():
+        await bot.restart()
+```
+
+### Idempotency key on SenderContext (v0.6.0)
+
+`ctx.event_id: str` is the 64-char hex id of the event that produced a DM: the outer
+gift wrap for NIP-17, or the kind-4 event for NIP-04. It is `""` when no event id is
+available (for example, zap contexts). The field defaults to `""`, so existing
+`SenderContext` construction keeps working.
+
+**Why it matters.** Handlers that call an HTTP backend need an idempotency key tied
+to the inbound message. Relay redelivery and multi-relay fan-out can deliver the
+same DM more than once; the in-memory dedup suppresses most repeats, but a process
+restart clears it. Passing `ctx.event_id` as the `Idempotency-Key` lets the backend
+deduplicate across those boundaries without inventing a second identifier scheme.
+
+**Usage.**
+
+```python
+@bot.on_dm
+async def handle_dm(ctx: SenderContext, text: str) -> None:
+    headers = {"Idempotency-Key": ctx.event_id} if ctx.event_id else {}
+    await post_to_backend(text, headers=headers)
+```
+
 ---
 
 ## Versions
 
-- **v0.5.2** (current) — NIP-40 expiration on gift wraps; nostr-sdk 0.45 upgrade.
+- **v0.6.0** (current) — watchdog hooks and idempotency keys.
+  - **Dependency**: `nostr-sdk` pin tightened to `>=0.45.1,<0.46` — stable
+    releases only, no alphas. Aligned to the stable API (`Event.tags()` returns
+    `list[Tag]`, `Tag.to_vec()` replaces `as_vec()`, and
+    `Keys.nip04_encrypt` is synchronous).
+  - **Watchdog**: `NostrBotConfig.watchdog_stall_seconds` plus
+    `NostrBot.last_activity_monotonic`; the notification loop refreshes the
+    timestamp for every frame it consumes, not just events.
+  - **Health/restart**: `NostrBot.health_check()` reports whether the loop,
+    relay pool, and stall window look healthy, and `NostrBot.restart()` performs
+    a soft reconnect without republishing kind 0 / 10002 / 10050.
+  - **Idempotency**: `SenderContext.event_id` carries the outer gift-wrap id
+    (NIP-17) or kind-4 id (NIP-04), defaulting to `""` for compatibility.
+  - **Version sync**: `__version__` and `pyproject.toml` are both `0.6.0`, and a
+    test now enforces that they stay in sync.
+- **v0.5.2** — NIP-40 expiration on gift wraps; nostr-sdk 0.45 upgrade.
   - **Gift-wrapped DMs now actually expire.** The NIP-40 tag was only ever
     placed inside the rumor, which a relay cannot read — so nothing was
     garbage-collected and gift wraps accumulated forever. `send_dm` now stamps

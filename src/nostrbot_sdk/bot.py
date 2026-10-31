@@ -54,6 +54,7 @@ from nostr_sdk import (
     KindStandard,
     Metadata,
     PublicKey,
+    RelayStatus,
     RelayUrl,
     ReqTarget,
     SendEventTarget,
@@ -74,6 +75,22 @@ from nostrbot_sdk.publishing import PublishResult, send_article, send_note
 from nostrbot_sdk.zap_verify import ValidatedZap, validate_zap_receipt
 
 log = logging.getLogger(__name__)
+
+# Relay statuses that mean the pool is still trying to deliver. DISCONNECTED,
+# BANNED, SHUTDOWN and TERMINATED are terminal; SLEEPING sits between retry
+# attempts and the SDK wakes it on its own, so it counts as alive.
+_CONNECTABLE_RELAY_STATUSES = frozenset({
+    RelayStatus.CONNECTED,
+    RelayStatus.CONNECTING,
+    RelayStatus.PENDING,
+    RelayStatus.INITIALIZED,
+    RelayStatus.SLEEPING,
+})
+
+# Pause between tearing down and reconnecting during restart(). Keeps the OS
+# from immediately reusing just-closed sockets (TIME_WAIT) and gives the Rust
+# relay pool a moment to finish teardown.
+RESTART_SETTLE_SECONDS = 1.0
 
 
 DmHandler = Callable[[SenderContext, str], Awaitable[None]]
@@ -159,6 +176,12 @@ class NostrBotConfig:
     lock_cleanup_interval_seconds: float = 300.0
     """How often the background loop reaps idle locks and expired caches."""
 
+    watchdog_stall_seconds: float | None = None
+    """Maximum seconds without consuming a notification frame (events, EOSE,
+    NOTICE, anything the notification loop yields) before health_check()
+    reports the bot unhealthy. None (the default) disables stall detection,
+    preserving the pre-0.6.0 behavior."""
+
 
 class NostrBot:
     """High-level Nostr bot runtime.
@@ -211,6 +234,12 @@ class NostrBot:
 
         # Lifecycle.
         self._tasks: list[asyncio.Task] = []
+        self._notification_task: asyncio.Task | None = None
+        # Monotonic timestamp of the last notification frame consumed by the
+        # notification loop. Refreshed for EVERY frame (not just events), so a
+        # hung loop reads as stale even while relay sockets say CONNECTED.
+        # Initialized in start().
+        self.last_activity_monotonic: float = 0.0
         # Per-event handler tasks spawned by _NotifyBridge. Strong references
         # are required: asyncio keeps only weak refs to tasks, so an untracked
         # fire-and-forget task can be garbage-collected mid-flight. stop()
@@ -419,7 +448,8 @@ class NostrBot:
     async def _send_nip04(self, pk: PublicKey, text: str) -> None:
         # No gift wrap here: a kind 4's created_at is the real send time, so a
         # plain absolute expiry leaks nothing that the event doesn't already say.
-        ciphertext = await self._signer.nip04_encrypt(pk, text)
+        # nostr-sdk >=0.45.1 stable: Keys.nip04_encrypt is synchronous.
+        ciphertext = self._signer.nip04_encrypt(pk, text)
         event = await (
             EventBuilder(Kind(4), ciphertext)
             .tags([
@@ -463,34 +493,17 @@ class NostrBot:
         event = await builder.finalize_async(self._signer)
         await self._client.send_event(event)
 
-    async def start(self) -> None:
-        """Connect to relays, publish profile/relay lists, subscribe.
-
-        After start() returns, the bot is processing events. Call stop() to
-        shut down or use run() which manages the full lifecycle including
-        signal handling.
-        """
-        if self._started:
-            raise RuntimeError("NostrBot already started")
-        # Allow start() after a prior stop(): background loops and run()
-        # watch this event, so a stale set() would make them exit instantly.
-        self._shutdown = asyncio.Event()
-
-        # 1. Add relays + connect.
-        for relay in self._config.relays:
-            await self._client.add_relay(RelayUrl.parse(relay))
-        await self._client.connect()
-        log.info("Connected to %d relay(s)", len(self._config.relays))
-
-        # 2. Publish kind 0 (Metadata) if profile is non-empty.
-        #    nostr-sdk >=0.45 dropped Client.set_metadata and the EventBuilder
-        #    kind constructors, so these three are built by hand.
+    async def _publish_profile_events(self) -> None:
+        """Publish kind 0, 10002, and 10050 according to the config flags."""
+        # Publish kind 0 (Metadata) if profile is non-empty.
+        # nostr-sdk >=0.45 dropped Client.set_metadata and the EventBuilder
+        # kind constructors, so these three are built by hand.
         if self._config.publish_kind_0 and self._config.profile:
             metadata = Metadata.from_json(json.dumps(self._config.profile))
             await self._publish(EventBuilder(Kind(0), metadata.as_json()))
             log.info("Published kind 0 profile")
 
-        # 3. Publish kind 10002 (NIP-65 relay list).
+        # Publish kind 10002 (NIP-65 relay list).
         if self._config.publish_kind_10002:
             # NIP-65: ["r", <url>] with no marker means read+write.
             relay_tags = [Tag.parse(["r", r]) for r in self._config.relays]
@@ -499,14 +512,31 @@ class NostrBot:
                 "Published kind 10002 relay list (%d relays)", len(relay_tags),
             )
 
-        # 4. Publish kind 10050 (NIP-17 DM inbox list).
+        # Publish kind 10050 (NIP-17 DM inbox list).
         if self._config.publish_kind_10050:
             inbox = self._config.relays[: self._config.inbox_relay_count]
             inbox_tags = [Tag.parse(["relay", r]) for r in inbox]
             await self._publish(EventBuilder(Kind(10050), "").tags(inbox_tags))
             log.info("Published kind 10050 DM inbox list (%d relays)", len(inbox))
 
-        # 5. Subscribe.
+    async def _connect_and_subscribe(self, *, publish: bool) -> None:
+        """Connect, subscribe, and spawn background tasks.
+
+        Shared by start() and restart(). `publish=False` skips the kind
+        0/10002/10050 publishes: relays already hold those events and a
+        reconnect must not fan out duplicate metadata (relay-storm concern).
+        """
+        # 1. Add relays + connect.
+        for relay in self._config.relays:
+            await self._client.add_relay(RelayUrl.parse(relay))
+        await self._client.connect()
+        log.info("Connected to %d relay(s)", len(self._config.relays))
+
+        # 2. Identity events on a cold start only.
+        if publish:
+            await self._publish_profile_events()
+
+        # 3. Subscribe.
         #    Kind 4 + 9735: .since(now) is safe.
         #    Kind 1059: NIP-17 randomizes created_at up to 2 days back, so
         #    .since(now) drops them. Use .limit(0) to receive new ones only.
@@ -528,16 +558,18 @@ class NostrBot:
         # Open the notification stream BEFORE subscribing: notifications()
         # only delivers what arrives after the call, so subscribing first
         # would race and drop the earliest events.
+        self.last_activity_monotonic = time.monotonic()
         notifications = self._client.notifications()
-        self._tasks.append(asyncio.create_task(
+        self._notification_task = asyncio.create_task(
             self._notification_loop(notifications),
             name="nostrbot_notifications",
-        ))
+        )
+        self._tasks.append(self._notification_task)
         await self._client.subscribe(ReqTarget.auto([f_legacy]))
         await self._client.subscribe(ReqTarget.auto([f_giftwrap]))
         log.info("Subscribed to kind 4, 1059, 9735")
 
-        # 6. Background tasks.
+        # 4. Background tasks.
         start_mono = time.monotonic()
         self._tasks.append(asyncio.create_task(
             self._maintenance_loop(),
@@ -549,10 +581,43 @@ class NostrBot:
                 name=f"nostrbot_heartbeat_{interval}s",
             ))
 
+    async def start(self) -> None:
+        """Connect to relays, publish profile/relay lists, subscribe.
+
+        After start() returns, the bot is processing events. Call stop() to
+        shut down or use run() which manages the full lifecycle including
+        signal handling.
+        """
+        if self._started:
+            raise RuntimeError("NostrBot already started")
+        # Allow start() after a prior stop(): background loops and run()
+        # watch this event, so a stale set() would make them exit instantly.
+        self._shutdown = asyncio.Event()
+        await self._connect_and_subscribe(publish=True)
         self._started = True
         log.info(
             "NostrBot running (pubkey: %s)", self._keys.public_key().to_bech32(),
         )
+
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel and reap every task this bot owns, leaving none behind."""
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Task error during teardown")
+        self._tasks.clear()
+        self._notification_task = None
+
+    async def _disconnect_client(self) -> None:
+        try:
+            await self._client.disconnect()
+        except Exception:
+            log.exception("Error disconnecting client")
 
     async def stop(self) -> None:
         """Cancel background tasks, drain in-flight handlers, disconnect.
@@ -566,16 +631,7 @@ class NostrBot:
         self._shutdown.set()
         # Cancel background loops first: this stops the notification bridge,
         # so no NEW handler tasks are spawned while we drain.
-        for t in self._tasks:
-            t.cancel()
-        for t in self._tasks:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                log.exception("Task error on shutdown")
-        self._tasks.clear()
+        await self._cancel_background_tasks()
 
         pending = [t for t in self._inflight if not t.done()]
         if pending:
@@ -596,12 +652,88 @@ class NostrBot:
                 await asyncio.gather(*still_pending, return_exceptions=True)
         self._inflight.clear()
 
-        try:
-            await self._client.disconnect()
-        except Exception:
-            log.exception("Error disconnecting client")
+        await self._disconnect_client()
         self._started = False
         log.info("NostrBot stopped")
+
+    async def health_check(self) -> bool:
+        """True when the bot looks able to receive events right now.
+
+        Healthy means: a client exists, the notification loop task is alive,
+        at least one relay is in a connectable status, and -- when
+        `watchdog_stall_seconds` is set -- a notification frame has been
+        consumed within that window.
+
+        Inspection errors are reported as unhealthy (False), never raised:
+        callers treat them as "ambiguously unhealthy" rather than crashing a
+        supervisor on a transient SDK glitch.
+        """
+        try:
+            if self._client is None:
+                return False
+
+            task = self._notification_task
+            if task is None or task.done():
+                return False
+
+            relays = await self._client.relays()
+            if not relays:
+                return False
+            if not any(
+                relay.status() in _CONNECTABLE_RELAY_STATUSES
+                for relay in relays.values()
+            ):
+                return False
+
+            stall_seconds = self._config.watchdog_stall_seconds
+            if stall_seconds is not None:
+                idle_for = time.monotonic() - self.last_activity_monotonic
+                if idle_for > stall_seconds:
+                    log.warning(
+                        "Notification loop stalled: no frame consumed for "
+                        "%.0fs (limit %.0fs)", idle_for, stall_seconds,
+                    )
+                    return False
+            return True
+        except Exception:
+            log.exception("health_check inspection failed; reporting unhealthy")
+            return False
+
+    async def restart(self) -> None:
+        """Soft reconnect: tear down the loop/client, settle, then reconnect.
+
+        Skips the kind 0/10002/10050 publishes: relays already hold those
+        events, and a reconnect storm must not fan out duplicate metadata.
+        Safe to call while stopped -- it performs a clean start instead.
+        In-flight handler tasks are left to finish (they share this bot's
+        client, so replies during the settle window may fail harmlessly).
+        """
+        if not self._started:
+            await self.start()
+            return
+
+        log.info("Restarting NostrBot (soft reconnect)")
+        self._started = False
+        self._shutdown.set()
+        await self._cancel_background_tasks()
+        await self._disconnect_client()
+        # Let closed sockets move toward TIME_WAIT and the Rust pool finish
+        # teardown before we ask it to open new ones.
+        await asyncio.sleep(RESTART_SETTLE_SECONDS)
+        self._shutdown = asyncio.Event()
+        try:
+            await self._connect_and_subscribe(publish=False)
+        except BaseException:
+            # A half-started reconnect must not leave the notification loop
+            # (or any background task) running behind an unstarted bot.
+            await self._cancel_background_tasks()
+            self._shutdown.set()
+            raise
+        self._started = True
+        log.info(
+            "NostrBot restarted (pubkey: %s)",
+            self._keys.public_key().to_bech32(),
+        )
 
     async def run(self) -> None:
         """Start, install signal handlers for SIGINT/SIGTERM, run until signal.
@@ -671,7 +803,10 @@ class NostrBot:
                 "Failed to decrypt NIP-04 DM from %s", sender_hex[:16],
             )
             return
-        await self._route_inbound(sender_pk, sender_hex, plaintext, "nip04")
+        await self._route_inbound(
+            sender_pk, sender_hex, plaintext, "nip04",
+            event_id=event.id().to_hex(),
+        )
 
     async def _handle_nip17_dm(self, event: Event) -> None:
         try:
@@ -691,7 +826,12 @@ class NostrBot:
             return
 
         sender_hex = sender_pk.to_hex()
-        await self._route_inbound(sender_pk, sender_hex, rumor.content(), "nip17")
+        # The recipient-facing event id is the outer gift wrap: that is what
+        # relays delivered and what a consumer can use as an idempotency key.
+        await self._route_inbound(
+            sender_pk, sender_hex, rumor.content(), "nip17",
+            event_id=event.id().to_hex(),
+        )
 
     async def _route_inbound(
         self,
@@ -699,8 +839,14 @@ class NostrBot:
         sender_hex: str,
         content: str,
         protocol: str,
+        event_id: str = "",
     ) -> None:
-        """Route an inbound DM to a push handler or the user DM handler."""
+        """Route an inbound DM to a push handler or the user DM handler.
+
+        `event_id` is the hex id of the event that produced the DM (the outer
+        gift wrap for NIP-17, the kind-4 event for NIP-04). It is exposed on
+        SenderContext for consumers that need an idempotency key.
+        """
         content_key = (sender_hex, content.strip())
 
         # System push (sender is a known backend)?
@@ -749,6 +895,7 @@ class NostrBot:
             sender_npub=sender_pk.to_bech32(),
             protocol=protocol,  # type: ignore[arg-type]
             _bot=self,
+            event_id=event_id,
         )
         lock = self._locks.get(sender_hex)
         try:
@@ -867,6 +1014,11 @@ class NostrBot:
                 if notification is None:
                     # Stream terminated (client shut down).
                     return
+                # Any frame -- NEW_EVENT *or* MESSAGE (EOSE/NOTICE/...) --
+                # proves the loop is still consuming, so refresh the heartbeat
+                # used by health_check(). A hung loop stops yielding frames
+                # even while relay sockets read CONNECTED.
+                self.last_activity_monotonic = time.monotonic()
                 if not isinstance(notification, ClientNotification.NEW_EVENT):
                     continue
                 task = asyncio.create_task(

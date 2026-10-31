@@ -14,7 +14,18 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from nostr_sdk import ClientNotification, Keys, PublicKey, UnwrappedGift
+from nostr_sdk import (
+    ClientNotification,
+    EventBuilder,
+    Keys,
+    Kind,
+    PublicKey,
+    RelayStatus,
+    RelayUrl,
+    Tag,
+    UnwrappedGift,
+    nip59_make_gift_wrap_async,
+)
 
 from nostrbot_sdk.bot import NostrBot, NostrBotConfig
 from nostrbot_sdk.zap_verify import ValidatedZap
@@ -50,7 +61,7 @@ def _stub_client_methods(bot: NostrBot) -> None:
     bot._client.send_event = AsyncMock()
     bot._client.add_relay = AsyncMock(return_value=False)
     bot._client.connect = AsyncMock()
-    bot._signer.nip04_encrypt = AsyncMock(return_value="<ciphertext>")
+    bot._signer.nip04_encrypt = MagicMock(return_value="<ciphertext>")
     # Default: recipient has no kind 10050 (tests override per-case).
     bot._nip17_support.check = AsyncMock(return_value=None)
 
@@ -272,7 +283,7 @@ async def test_send_dm_known_nip04_sends_kind_4_event(bot, other_pk_hex) -> None
     ok = await bot.send_dm(other_pk_hex, "hello")
     assert ok is True
     assert _sent_kinds(bot) == [4]
-    bot._signer.nip04_encrypt.assert_awaited_once()
+    bot._signer.nip04_encrypt.assert_called_once()
 
 
 async def test_send_dm_unknown_protocol_checks_kind_10050(bot, other_pk_hex) -> None:
@@ -716,6 +727,281 @@ async def test_maintenance_loop_calls_cleanup_methods(bot) -> None:
     assert bot._locks.cleanup_idle.called
     assert bot._nip17_support.cleanup_expired.called
     assert bot._identity.cleanup_expired.called
+
+
+# -- wiring helpers for watchdog / restart tests --------------------------------
+
+
+class _BlockingStream:
+    """Notification stream that never yields (keeps the loop task alive)."""
+
+    def __init__(self) -> None:
+        self._forever = asyncio.Event()
+
+    async def next(self):
+        await self._forever.wait()
+        return None
+
+
+def _stub_lifecycle_client(bot: NostrBot) -> None:
+    """Stub every Client method start()/restart()/stop() touch."""
+    bot._client.add_relay = AsyncMock(return_value=True)
+    bot._client.connect = AsyncMock()
+    bot._client.subscribe = AsyncMock()
+    bot._client.send_event = AsyncMock()
+    bot._client.disconnect = AsyncMock()
+    bot._client.notifications = MagicMock(side_effect=lambda: _BlockingStream())
+
+
+def _relay_with_status(status: RelayStatus) -> MagicMock:
+    relay = MagicMock()
+    relay.status.return_value = status
+    return relay
+
+
+async def _health_bot(bot: NostrBot, *, status=RelayStatus.CONNECTED):
+    """Give a bot a live notification task and one relay of `status`."""
+    task = asyncio.create_task(asyncio.sleep(60))
+    bot._notification_task = task
+    relay = _relay_with_status(status)
+    bot._client.relays = AsyncMock(
+        return_value={RelayUrl.parse("wss://relay.example/"): relay},
+    )
+    return task
+
+
+async def _reap(*tasks: asyncio.Task) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# -- watchdog: activity + health_check -----------------------------------------
+
+
+def test_watchdog_stall_seconds_defaults_to_none() -> None:
+    assert NostrBotConfig(
+        nsec=_fresh_nsec(), relays=["wss://relay.example/"],
+    ).watchdog_stall_seconds is None
+
+
+async def test_start_initializes_last_activity_and_tracks_notification_task(bot) -> None:
+    _stub_lifecycle_client(bot)
+    assert bot.last_activity_monotonic == 0.0
+
+    await bot.start()
+
+    assert bot.last_activity_monotonic > 0
+    assert bot._notification_task is not None
+    assert not bot._notification_task.done()
+    assert bot._notification_task in bot._tasks
+    await bot.stop()
+    assert bot._notification_task is None
+
+
+async def test_notification_loop_refreshes_activity_for_non_event_frames(bot) -> None:
+    """EOSE/NOTICE/SHUTDOWN frames prove the loop is consuming, too."""
+    bot.last_activity_monotonic = 0.0
+    await asyncio.wait_for(
+        bot._notification_loop(_stream(ClientNotification.SHUTDOWN())),
+        timeout=1.0,
+    )
+    assert bot.last_activity_monotonic > 0
+
+
+async def test_health_check_true_when_client_task_and_relay_are_healthy(bot) -> None:
+    task = await _health_bot(bot)
+    try:
+        assert await bot.health_check() is True
+    finally:
+        await _reap(task)
+
+
+async def test_health_check_false_without_client(bot) -> None:
+    bot._client = None  # type: ignore[assignment]
+    assert await bot.health_check() is False
+
+
+async def test_health_check_false_without_live_notification_task(bot) -> None:
+    bot._client.relays = AsyncMock(return_value={
+        RelayUrl.parse("wss://relay.example/"): _relay_with_status(
+            RelayStatus.CONNECTED,
+        ),
+    })
+    assert await bot.health_check() is False
+
+    done = asyncio.create_task(asyncio.sleep(0))
+    await done
+    bot._notification_task = done
+    assert await bot.health_check() is False
+
+
+async def test_health_check_false_when_no_connectable_relays(bot) -> None:
+    task = await _health_bot(bot, status=RelayStatus.DISCONNECTED)
+    try:
+        assert await bot.health_check() is False
+    finally:
+        await _reap(task)
+
+
+async def test_health_check_false_on_inspection_error(bot) -> None:
+    task = await _health_bot(bot)
+    bot._client.relays = AsyncMock(side_effect=RuntimeError("sdk glitch"))
+    try:
+        assert await bot.health_check() is False
+    finally:
+        await _reap(task)
+
+
+async def test_health_check_ignores_stall_when_watchdog_disabled(bot) -> None:
+    bot._config = NostrBotConfig(
+        nsec=bot._config.nsec,
+        relays=bot._config.relays,
+        watchdog_stall_seconds=None,
+    )
+    task = await _health_bot(bot)
+    bot.last_activity_monotonic = time.monotonic() - 10_000
+    try:
+        assert await bot.health_check() is True
+    finally:
+        await _reap(task)
+
+
+async def test_health_check_false_when_stall_threshold_exceeded(bot) -> None:
+    bot._config = NostrBotConfig(
+        nsec=bot._config.nsec,
+        relays=bot._config.relays,
+        watchdog_stall_seconds=5.0,
+    )
+    task = await _health_bot(bot)
+    bot.last_activity_monotonic = time.monotonic()
+    try:
+        assert await bot.health_check() is True
+        bot.last_activity_monotonic = time.monotonic() - 6.0
+        assert await bot.health_check() is False
+    finally:
+        await _reap(task)
+
+
+# -- restart: soft reconnect ---------------------------------------------------
+
+
+async def test_restart_while_stopped_performs_a_clean_start(bot) -> None:
+    bot.start = AsyncMock()  # type: ignore[method-assign]
+    await bot.restart()
+    bot.start.assert_awaited_once()
+
+
+async def test_restart_soft_reconnects_without_republishing(bot, monkeypatch) -> None:
+    monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
+    _stub_lifecycle_client(bot)
+
+    await bot.start()
+    sends_after_start = bot._client.send_event.await_count
+    connects_after_start = bot._client.connect.await_count
+    subscribes_after_start = bot._client.subscribe.await_count
+    old_notification_task = bot._notification_task
+    assert sends_after_start == 3  # kind 0, 10002, 10050
+
+    await bot.restart()
+
+    # Reconnected, re-added/re-subscribed, but no duplicate identity events.
+    assert bot._client.connect.await_count == connects_after_start + 1
+    assert bot._client.subscribe.await_count == subscribes_after_start + 2
+    assert bot._client.send_event.await_count == sends_after_start
+    assert bot._client.add_relay.await_count == 2
+    assert bot._client.disconnect.await_count == 1
+    # No leaked tasks: the old loop is reaped, the new one is alive.
+    assert old_notification_task is not None and old_notification_task.done()
+    assert bot._notification_task is not old_notification_task
+    assert not bot._notification_task.done()
+    assert sorted(t.get_name() for t in bot._tasks) == [
+        "nostrbot_maintenance", "nostrbot_notifications",
+    ]
+    assert not bot._shutdown.is_set()
+
+    await bot.stop()
+    assert bot._tasks == []
+    assert bot._notification_task is None
+
+
+async def test_restart_does_not_publish_when_kind_flags_are_on(bot, monkeypatch) -> None:
+    """Even with every publish flag enabled, restart() must not rebroadcast."""
+    monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
+    _stub_lifecycle_client(bot)
+    bot._config = NostrBotConfig(
+        nsec=bot._config.nsec,
+        relays=bot._config.relays,
+        profile={"name": "TestBot"},
+        publish_kind_0=True,
+        publish_kind_10002=True,
+        publish_kind_10050=True,
+    )
+
+    await bot.start()
+    sends = bot._client.send_event.await_count
+    await bot.restart()
+    assert bot._client.send_event.await_count == sends
+    await bot.stop()
+
+
+# -- SenderContext.event_id ----------------------------------------------------
+
+
+async def test_route_inbound_populates_event_id(bot, other_pk_hex) -> None:
+    seen: list[str] = []
+
+    @bot.on_dm
+    async def h(ctx, text):
+        seen.append(ctx.event_id)
+
+    await bot._route_inbound(
+        PublicKey.parse(other_pk_hex), other_pk_hex, "hi", "nip17",
+        event_id="ab" * 32,
+    )
+    assert seen == ["ab" * 32]
+
+
+async def test_nip04_dm_context_uses_kind4_event_id(bot) -> None:
+    sender = Keys.generate()
+    recipient_pk = bot.keys.public_key()
+    ciphertext = sender.nip04_encrypt(recipient_pk, "hello")
+    event = await (
+        EventBuilder(Kind(4), ciphertext)
+        .tags([Tag.public_key(recipient_pk)])
+        .finalize_async(sender)
+    )
+    bot._start_time = None
+
+    seen: list[str] = []
+
+    @bot.on_dm
+    async def h(ctx, text):
+        seen.append(ctx.event_id)
+
+    await bot._handle_nip04_dm(event)
+    assert seen == [event.id().to_hex()]
+
+
+async def test_nip17_dm_context_uses_outer_gift_wrap_event_id(bot) -> None:
+    sender = Keys.generate()
+    recipient_pk = bot.keys.public_key()
+    rumor = (
+        EventBuilder(Kind(14), "hello")
+        .tags([Tag.public_key(recipient_pk)])
+        .finalize_unsigned(sender.public_key())
+    )
+    wrap = await nip59_make_gift_wrap_async(sender, recipient_pk, rumor)
+    bot._start_time = None
+
+    seen: list[tuple[str, str]] = []
+
+    @bot.on_dm
+    async def h(ctx, text):
+        seen.append((ctx.event_id, text))
+
+    await bot._handle_nip17_dm(wrap)
+    assert seen == [(wrap.id().to_hex(), "hello")]
 
 
 # -- heartbeat loop ------------------------------------------------------------
