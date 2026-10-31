@@ -55,8 +55,8 @@ def validate_zap_receipt(
     # -- Extract tags --
     bolt11_str: str | None = None
     description_json: str | None = None
-    for tag in event.tags().to_vec():
-        tag_vec = tag.as_vec()
+    for tag in event.tags():
+        tag_vec = tag.to_vec()
         if len(tag_vec) >= 2:
             if tag_vec[0] == "bolt11":
                 bolt11_str = tag_vec[1]
@@ -117,8 +117,8 @@ def validate_zap_receipt(
 
     # -- CHECK 5: 9734 'p' tag must reference our bot pubkey --
     p_tags: list[str] = []
-    for tag in zap_request_event.tags().to_vec():
-        tag_vec = tag.as_vec()
+    for tag in zap_request_event.tags():
+        tag_vec = tag.to_vec()
         if len(tag_vec) >= 2 and tag_vec[0] == "p":
             p_tags.append(tag_vec[1])
 
@@ -130,8 +130,8 @@ def validate_zap_receipt(
         return None
 
     # -- CHECK 6: If 9734 has 'amount' tag, it must match bolt11 --
-    for tag in zap_request_event.tags().to_vec():
-        tag_vec = tag.as_vec()
+    for tag in zap_request_event.tags():
+        tag_vec = tag.to_vec()
         if len(tag_vec) >= 2 and tag_vec[0] == "amount":
             try:
                 requested_msats: int = int(tag_vec[1])

@@ -55,6 +55,19 @@ def _stub_client_methods(bot: NostrBot) -> None:
     bot._nip17_support.check = AsyncMock(return_value=None)
 
 
+def _expiration_secs(event) -> int | None:
+    """Value of an event's NIP-40 expiration tag (None if absent).
+
+    nostr-sdk >=0.45.1 stable returns a plain list[Tag] from Event.tags();
+    there is no Tags wrapper with an `.expiration()` helper.
+    """
+    for tag in event.tags():
+        vec = tag.to_vec()
+        if len(vec) >= 2 and vec[0] == "expiration":
+            return int(vec[1])
+    return None
+
+
 def _sent_kinds(bot: NostrBot) -> list[int]:
     """Kinds of every event handed to client.send_event."""
     return [
@@ -296,13 +309,13 @@ async def test_nip17_dm_carries_same_expiration_inside_and_outside_wrap(bot) -> 
 
     wrap = bot._client.send_event.await_args.args[0]
     assert wrap.kind().as_u16() == 1059
-    outer = wrap.tags().expiration()
+    outer = _expiration_secs(wrap)
     assert outer is not None, "relay-visible expiration missing from the wrap"
 
     unwrapped = await UnwrappedGift.from_gift_wrap_async(recipient, wrap)
-    inner = unwrapped.rumor().tags().expiration()
+    inner = _expiration_secs(unwrapped.rumor())
     assert inner is not None, "recipient-visible expiration missing from the rumor"
-    assert inner.as_secs() == outer.as_secs()
+    assert inner == outer
 
 
 async def test_nip17_wrap_expiration_does_not_leak_real_send_time(bot) -> None:
@@ -315,12 +328,12 @@ async def test_nip17_wrap_expiration_does_not_leak_real_send_time(bot) -> None:
     await bot.send_dm(recipient.public_key().to_hex(), "hello")
 
     wrap = bot._client.send_event.await_args.args[0]
-    implied_send_time = (
-        wrap.tags().expiration().as_secs() - bot._config.dm_expiry_seconds
-    )
+    expiration = _expiration_secs(wrap)
+    assert expiration is not None
+    implied_send_time = expiration - bot._config.dm_expiry_seconds
     assert implied_send_time <= now
     # Still bounded: at least three quarters of the lifetime survives.
-    assert wrap.tags().expiration().as_secs() > now
+    assert expiration > now
 
 
 async def test_nip04_dm_carries_plain_absolute_expiration(bot, other_pk_hex) -> None:
@@ -333,9 +346,9 @@ async def test_nip04_dm_carries_plain_absolute_expiration(bot, other_pk_hex) -> 
 
     event = bot._client.send_event.await_args.args[0]
     assert event.kind().as_u16() == 4
-    expiration = event.tags().expiration()
+    expiration = _expiration_secs(event)
     assert expiration is not None
-    assert expiration.as_secs() >= now + bot._config.dm_expiry_seconds - 5
+    assert expiration >= now + bot._config.dm_expiry_seconds - 5
 
 
 async def test_send_dm_swallows_exceptions_and_returns_false(bot, other_pk_hex) -> None:

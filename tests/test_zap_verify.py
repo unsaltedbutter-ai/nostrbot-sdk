@@ -23,14 +23,8 @@ AMOUNT_MSATS: int = 3_000_000  # 3000 sats
 
 def _make_tag(key: str, value: str) -> MagicMock:
     tag = MagicMock()
-    tag.as_vec.return_value = [key, value]
+    tag.to_vec.return_value = [key, value]
     return tag
-
-
-def _make_tags_obj(tags: list[MagicMock]) -> MagicMock:
-    obj = MagicMock()
-    obj.to_vec.return_value = tags
-    return obj
 
 
 def _make_9734_json(
@@ -76,9 +70,10 @@ def _make_9734_event(
     mock_tags: list[MagicMock] = []
     for t in obj["tags"]:
         tag = MagicMock()
-        tag.as_vec.return_value = t
+        tag.to_vec.return_value = t
         mock_tags.append(tag)
-    event.tags.return_value = _make_tags_obj(mock_tags)
+    # nostr-sdk >=0.45.1 stable: Event.tags() returns list[Tag].
+    event.tags.return_value = mock_tags
 
     return event
 
@@ -107,7 +102,7 @@ def _make_9735(
         tags.append(_make_tag("bolt11", bolt11_str))
     if include_description and description_json is not None:
         tags.append(_make_tag("description", description_json))
-    event.tags.return_value = _make_tags_obj(tags)
+    event.tags.return_value = tags
 
     return event
 

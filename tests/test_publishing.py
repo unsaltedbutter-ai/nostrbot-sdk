@@ -22,12 +22,12 @@ from nostrbot_sdk.publishing import (
 
 
 def _tag_vec(tag: Tag) -> list[str]:
-    return list(tag.as_vec())
+    return list(tag.to_vec())
 
 
 def _tag_kinds(tags: list[Tag]) -> list[str]:
     """First element of each tag (`e`, `p`, `q`, etc.)."""
-    return [t.as_vec()[0] for t in tags]
+    return [t.to_vec()[0] for t in tags]
 
 
 def _output_mock(

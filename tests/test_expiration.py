@@ -16,7 +16,7 @@ LOGGER = "nostrbot_sdk.expiration"
 
 
 def _secs(tag) -> int:
-    vec = tag.as_vec()
+    vec = tag.to_vec()
     assert vec[0] == "expiration"
     return int(vec[1])
 

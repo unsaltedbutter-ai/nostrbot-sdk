@@ -34,20 +34,17 @@ def _make_event_with_relay_tags(relay_urls: list[str]):
     tags = []
     for url in relay_urls:
         tag = MagicMock()
-        tag.as_vec.return_value = ["relay", url]
+        tag.to_vec.return_value = ["relay", url]
         tags.append(tag)
-    tag_list = MagicMock()
-    tag_list.to_vec.return_value = tags
-    event.tags.return_value = tag_list
+    # nostr-sdk >=0.45.1 stable: Event.tags() returns list[Tag].
+    event.tags.return_value = tags
     return event
 
 
 def _make_event_with_no_relay_tags():
     """Build a mock Event with no relay tags (malformed kind 10050)."""
     event = MagicMock()
-    tag_list = MagicMock()
-    tag_list.to_vec.return_value = []
-    event.tags.return_value = tag_list
+    event.tags.return_value = []
     return event
 
 
@@ -126,11 +123,9 @@ class TestNip17SupportCheck:
         tags = []
         for url in ["wss://valid.com", "", "  "]:
             tag = MagicMock()
-            tag.as_vec.return_value = ["relay", url]
+            tag.to_vec.return_value = ["relay", url]
             tags.append(tag)
-        tag_list = MagicMock()
-        tag_list.to_vec.return_value = tags
-        event.tags.return_value = tag_list
+        event.tags.return_value = tags
 
         client.fetch_events.return_value = _make_events_result([event])
 
@@ -145,17 +140,15 @@ class TestNip17SupportCheck:
         event = MagicMock()
         tags = []
         t1 = MagicMock()
-        t1.as_vec.return_value = ["relay", "wss://inbox.example.com"]
+        t1.to_vec.return_value = ["relay", "wss://inbox.example.com"]
         tags.append(t1)
         t2 = MagicMock()
-        t2.as_vec.return_value = ["p", "aa" * 32]
+        t2.to_vec.return_value = ["p", "aa" * 32]
         tags.append(t2)
         t3 = MagicMock()
-        t3.as_vec.return_value = ["relay"]
+        t3.to_vec.return_value = ["relay"]
         tags.append(t3)
-        tag_list = MagicMock()
-        tag_list.to_vec.return_value = tags
-        event.tags.return_value = tag_list
+        event.tags.return_value = tags
 
         client.fetch_events.return_value = _make_events_result([event])
 

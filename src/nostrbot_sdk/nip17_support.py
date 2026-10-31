@@ -139,8 +139,8 @@ class Nip17Support:
 
         event = events.first()
         relay_urls: list[str] = []
-        for tag in event.tags().to_vec():
-            tag_vec = tag.as_vec()
+        for tag in event.tags():
+            tag_vec = tag.to_vec()
             if len(tag_vec) >= 2 and tag_vec[0] == "relay":
                 url = tag_vec[1].strip()
                 if url:
