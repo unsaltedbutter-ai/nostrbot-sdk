@@ -10,6 +10,7 @@ used.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -923,6 +924,48 @@ async def test_restart_soft_reconnects_without_republishing(bot, monkeypatch) ->
     await bot.stop()
     assert bot._tasks == []
     assert bot._notification_task is None
+
+
+# -- gift-wrap subscription: bounded lookback -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gift_wrap_subscription_bounds_replay_with_since(bot, monkeypatch) -> None:
+    """The kind-1059 filter pairs limit(0) with a .since lookback window.
+
+    nos.lol-style relays serve zero stored events for limit:0 (live frames
+    only — verified empirically 2026-10-31), but relays that read limit:0
+    as "unlimited" would replay their whole retention to a fresh subscriber.
+    The window must exceed NIP-59's 48h created_at randomization, or
+    since-filtering relays would drop backdated DMs.
+    """
+    captured: list = []
+
+    class _StubReqTarget:
+        @staticmethod
+        def auto(filters):
+            captured.extend(filters)
+            return object()
+
+    monkeypatch.setattr("nostrbot_sdk.bot.ReqTarget", _StubReqTarget)
+    _stub_lifecycle_client(bot)
+
+    try:
+        await bot.start()
+
+        assert len(captured) == 2
+        gift_wraps = [
+            f for f in captured if json.loads(f.as_json()).get("kinds") == [1059]
+        ]
+        assert len(gift_wraps) == 1
+        payload = json.loads(gift_wraps[0].as_json())
+        expected_since = time.time() - bot._config.gift_wrap_lookback_seconds
+        assert abs(payload["since"] - expected_since) < 60
+        assert payload["limit"] == 0
+    finally:
+        await bot.stop()
+        assert bot._tasks == []
+        assert bot._notification_task is None
 
 
 async def test_restart_does_not_publish_when_kind_flags_are_on(bot, monkeypatch) -> None:

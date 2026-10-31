@@ -770,6 +770,31 @@ async def handle_dm(ctx: SenderContext, text: str) -> None:
     await post_to_backend(text, headers=headers)
 ```
 
+### Bounded gift-wrap subscription lookback (v0.6.0)
+
+`NostrBotConfig(gift_wrap_lookback_seconds=...)` (default: 49 hours — NIP-59's
+48-hour created_at randomization window plus one hour of boundary slack) sets
+the `.since` on the kind-1059 gift-wrap subscription filter, alongside the
+existing `.limit(0)`.
+
+**Why it matters.** Relays disagree on what `limit: 0` means. nos.lol serves
+zero stored events and only live frames (verified empirically 2026-10-31), but
+relays that read `0` as "unlimited" would replay their entire retention to a
+fresh subscriber — a cold-started bot would reprocess days of old DMs. The
+window must exceed NIP-59's 48-hour randomization because `.since(now)` drops
+real backdated DMs; within the window, the SDK's dedup cache suppresses
+replayed duplicates.
+
+**Usage.**
+
+```python
+cfg = NostrBotConfig(
+    nsec="nsec1...",
+    relays=["wss://nos.lol"],
+    gift_wrap_lookback_seconds=49 * 3600,  # default; shrink cautiously
+)
+```
+
 ---
 
 ## Versions

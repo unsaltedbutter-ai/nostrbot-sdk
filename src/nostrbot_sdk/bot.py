@@ -182,6 +182,18 @@ class NostrBotConfig:
     reports the bot unhealthy. None (the default) disables stall detection,
     preserving the pre-0.6.0 behavior."""
 
+    gift_wrap_lookback_seconds: int = 49 * 3600
+    """Lookback window (`.since`) on the kind-1059 gift-wrap subscription
+    filter. NIP-59 randomizes gift-wrap created_at up to 48 hours back, so
+    the window must be at least that or backdated DMs are dropped — the
+    default adds one hour of boundary slack. Purpose: relays disagree on
+    `limit: 0` semantics (nos.lol serves zero stored events and only live
+    frames; others treat 0 as unlimited). On the unlimited-replay kind, this
+    window caps how much history a fresh subscriber receives; the SDK's
+    dedup absorbs the remainder. Verified empirically on nos.lol
+    (2026-10-31): limit:0 with no since serves no stored events and live
+    delivery is unaffected; the since guard is insurance for other relays."""
+
 
 class NostrBot:
     """High-level Nostr bot runtime.
@@ -538,8 +550,14 @@ class NostrBot:
 
         # 3. Subscribe.
         #    Kind 4 + 9735: .since(now) is safe.
-        #    Kind 1059: NIP-17 randomizes created_at up to 2 days back, so
-        #    .since(now) drops them. Use .limit(0) to receive new ones only.
+        #    Kind 1059: NIP-17 (NIP-59) randomizes created_at up to 48h back,
+        #    so .since(now) drops real DMs. The filter pairs .limit(0) with a
+        #    bounded .since() lookback window: on nos.lol-style relays
+        #    limit:0 alone means "zero stored events, live frames only"
+        #    (verified empirically 2026-10-31); on relays that read limit:0
+        #    as "unlimited", the since window caps replay to
+        #    gift_wrap_lookback_seconds instead of the relay's full
+        #    retention, and the dedup cache absorbs the rest.
         self._start_time = Timestamp.now()
         bot_pk = self._keys.public_key()
 
@@ -549,10 +567,14 @@ class NostrBot:
             .kinds([Kind(4), Kind.from_std(KindStandard.ZAP_RECEIPT)])
             .since(self._start_time)
         )
+        gift_wrap_since = Timestamp.from_secs(
+            int(time.time()) - self._config.gift_wrap_lookback_seconds
+        )
         f_giftwrap = (
             Filter()
             .pubkey(bot_pk)
             .kind(Kind.from_std(KindStandard.GIFT_WRAP))
+            .since(gift_wrap_since)
             .limit(0)
         )
         # Open the notification stream BEFORE subscribing: notifications()
