@@ -852,7 +852,14 @@ for chunk, backdate in zip(chunks, backdates):
 
 ## Versions
 
-- **v0.8.0** (current) — controlled-timestamp gift wraps for ordered
+- **v0.9.0** (current) — metadata republish on reconnect.
+  - **Changed**: `restart()` now republishes kind 0/10002/10050 after
+    reconnecting (previously skipped). Stale relay lists strand senders
+    that read them; replaceable events make the republish idempotent.
+  - **New**: `republish_metadata()` to re-broadcast the metadata on demand —
+    e.g. to repair a publish that a relay's per-IP rate limit silently
+    dropped during a multi-bot startup burst.
+- **v0.8.0** — controlled-timestamp gift wraps for ordered
   multi-chunk messages.
   - **New**: `make_gift_wrap_async(signer, receiver, rumor, *, expiration,
     extra_tags, wrap_created_at)` in `nostrbot_sdk.gift_wrap` — a NIP-59

@@ -768,11 +768,13 @@ class NostrBot:
     async def restart(self) -> None:
         """Soft reconnect: tear down the loop/client, settle, then reconnect.
 
-        Skips the kind 0/10002/10050 publishes: relays already hold those
-        events, and a reconnect storm must not fan out duplicate metadata.
-        Safe to call while stopped -- it performs a clean start instead.
-        In-flight handler tasks are left to finish (they share this bot's
-        client, so replies during the settle window may fail harmlessly).
+        Republishes the kind 0/10002/10050 metadata after reconnecting so
+        relay lists always reflect current config (owner decision
+        2026-11-01: stale DM-relay lists strand senders that read them;
+        replaceable events make the republish idempotent). Safe to call
+        while stopped -- it performs a clean start instead. In-flight
+        handler tasks are left to finish (they share this bot's client, so
+        replies during the settle window may fail harmlessly).
         """
         if not self._started:
             await self.start()
@@ -788,7 +790,7 @@ class NostrBot:
         await asyncio.sleep(RESTART_SETTLE_SECONDS)
         self._shutdown = asyncio.Event()
         try:
-            await self._connect_and_subscribe(publish=False)
+            await self._connect_and_subscribe(publish=True)
         except BaseException:
             # A half-started reconnect must not leave the notification loop
             # (or any background task) running behind an unstarted bot.
@@ -800,6 +802,15 @@ class NostrBot:
             "NostrBot restarted (pubkey: %s)",
             self._keys.public_key().to_bech32(),
         )
+
+    async def republish_metadata(self) -> None:
+        """Re-broadcast kind 0/10002/10050 to the pool, on demand.
+
+        Use after changing relays/profile, or to repair silently dropped
+        publishes (relay per-IP rate limits reject bursts without feedback —
+        a multi-personality startup lost a DM relay list this way).
+        """
+        await self._publish_profile_events()
 
     async def run(self) -> None:
         """Start, install signal handlers for SIGINT/SIGTERM, run until signal.

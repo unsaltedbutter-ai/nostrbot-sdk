@@ -893,7 +893,7 @@ async def test_restart_while_stopped_performs_a_clean_start(bot) -> None:
     bot.start.assert_awaited_once()
 
 
-async def test_restart_soft_reconnects_without_republishing(bot, monkeypatch) -> None:
+async def test_restart_soft_reconnects_and_republishes(bot, monkeypatch) -> None:
     monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
     _stub_lifecycle_client(bot)
 
@@ -906,10 +906,11 @@ async def test_restart_soft_reconnects_without_republishing(bot, monkeypatch) ->
 
     await bot.restart()
 
-    # Reconnected, re-added/re-subscribed, but no duplicate identity events.
+    # Reconnected, re-added/re-subscribed, and metadata republished: relay
+    # lists must reflect current config even after a soft reconnect.
     assert bot._client.connect.await_count == connects_after_start + 1
     assert bot._client.subscribe.await_count == subscribes_after_start + 2
-    assert bot._client.send_event.await_count == sends_after_start
+    assert bot._client.send_event.await_count == sends_after_start + 3
     assert bot._client.add_relay.await_count == 2
     assert bot._client.disconnect.await_count == 1
     # No leaked tasks: the old loop is reaped, the new one is alive.
@@ -968,8 +969,8 @@ async def test_gift_wrap_subscription_bounds_replay_with_since(bot, monkeypatch)
         assert bot._notification_task is None
 
 
-async def test_restart_does_not_publish_when_kind_flags_are_on(bot, monkeypatch) -> None:
-    """Even with every publish flag enabled, restart() must not rebroadcast."""
+async def test_restart_republishes_when_kind_flags_are_on(bot, monkeypatch) -> None:
+    """With every publish flag enabled, restart() republishes all metadata."""
     monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
     _stub_lifecycle_client(bot)
     bot._config = NostrBotConfig(
@@ -984,7 +985,37 @@ async def test_restart_does_not_publish_when_kind_flags_are_on(bot, monkeypatch)
     await bot.start()
     sends = bot._client.send_event.await_count
     await bot.restart()
-    assert bot._client.send_event.await_count == sends
+    assert bot._client.send_event.await_count == sends + 3
+    await bot.stop()
+
+
+async def test_restart_skips_republish_when_kind_flags_are_off(bot, monkeypatch) -> None:
+    """With the publish flags disabled, restart() sends nothing extra."""
+    monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
+    _stub_lifecycle_client(bot)
+    bot._config = NostrBotConfig(
+        nsec=bot._config.nsec,
+        relays=bot._config.relays,
+        publish_kind_0=False,
+        publish_kind_10002=False,
+        publish_kind_10050=False,
+    )
+
+    await bot.start()
+    assert bot._client.send_event.await_count == 0
+    await bot.restart()
+    assert bot._client.send_event.await_count == 0
+    await bot.stop()
+
+
+async def test_republish_metadata_public_wrapper(bot, monkeypatch) -> None:
+    """republish_metadata() re-broadcasts kind 0/10002/10050 on demand."""
+    monkeypatch.setattr("nostrbot_sdk.bot.RESTART_SETTLE_SECONDS", 0.0)
+    _stub_lifecycle_client(bot)
+    await bot.start()
+    sends = bot._client.send_event.await_count
+    await bot.republish_metadata()
+    assert bot._client.send_event.await_count == sends + 3
     await bot.stop()
 
 
