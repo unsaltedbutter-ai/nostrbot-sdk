@@ -577,6 +577,12 @@ class NostrBot:
         reconnect must not fan out duplicate metadata (relay-storm concern).
         """
         # 1. Add relays + connect.
+        #    NIP-42: AUTH challenges arrive on Rust relay threads during
+        #    connect(); uniffi dispatches the async make_auth_event callback
+        #    onto the event loop recorded here. Refresh on every start so a
+        #    recreated loop is always the one used — and do it BEFORE
+        #    connect(), which is when the first challenge can arrive.
+        uniffi_set_event_loop(asyncio.get_running_loop())
         for relay in self._config.relays:
             await self._client.add_relay(RelayUrl.parse(relay))
         await self._client.connect()
@@ -596,11 +602,6 @@ class NostrBot:
         #    as "unlimited", the since window caps replay to
         #    gift_wrap_lookback_seconds instead of the relay's full
         #    retention, and the dedup cache absorbs the rest.
-        #    NIP-42: AUTH challenges arrive on Rust relay threads; uniffi
-        #    dispatches the async make_auth_event callback onto the event
-        #    loop recorded here. Refresh on every start so a recreated loop
-        #    is always the one used.
-        uniffi_set_event_loop(asyncio.get_running_loop())
         self._start_time = Timestamp.now()
         bot_pk = self._keys.public_key()
 
