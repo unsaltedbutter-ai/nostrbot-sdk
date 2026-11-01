@@ -819,11 +819,47 @@ cfg = NostrBotConfig(
 )
 ```
 
+### Ordered multi-chunk DMs (v0.8.0)
+
+`make_gift_wrap_async` builds a NIP-17 gift wrap with an optional
+`wrap_created_at` override.
+
+**Why it matters.** NIP-59 randomizes each gift wrap's timestamp up to two
+days into the past, so a multi-chunk message arrives in the client scrambled
+— later chunks can appear days before earlier ones. Assigning each chunk a
+random backdate sorted in descending order keeps every wrap individually
+random-looking to relays while guaranteeing the client shows the chunks in
+reading order.
+
+**Usage.**
+
+```python
+import random, time
+from nostrbot_sdk.gift_wrap import make_gift_wrap_async
+
+chunks = chunker(long_text)
+now = int(time.time())
+backdates = sorted((random.randint(0, 3600) for _ in chunks), reverse=True)
+for chunk, backdate in zip(chunks, backdates):
+    rumor = build_rumor(chunk)
+    wrap = await make_gift_wrap_async(
+        signer, recipient, rumor, extra_tags=[expiration_tag(ttl)],
+        wrap_created_at=now - backdate,
+    )
+```
+
 ---
 
 ## Versions
 
-- **v0.7.0** (current) — NIP-42 authentication for private DM inboxes.
+- **v0.8.0** (current) — controlled-timestamp gift wraps for ordered
+  multi-chunk messages.
+  - **New**: `make_gift_wrap_async(signer, receiver, rumor, *, expiration,
+    extra_tags, wrap_created_at)` in `nostrbot_sdk.gift_wrap` — a NIP-59
+    gift wrap whose wrap-level `created_at` the caller can pin (the stock
+    helper randomizes it up to 2 days back, which scrambles the order of
+    multi-chunk messages in clients). See "Ordered multi-chunk DMs" below.
+- **v0.7.0** — NIP-42 authentication for private DM inboxes.
   - **New**: `NostrBotConfig.nip42_auth` (default `True`) — the client answers
     relay AUTH challenges with a signed kind-22242 event, so bots work against
     private inboxes that serve gift wraps only to the authenticated

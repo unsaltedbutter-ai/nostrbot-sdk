@@ -1143,3 +1143,62 @@ async def test_start_records_event_loop_for_nip42_callbacks(bot, monkeypatch):
     assert len(recorded) == 1
     assert recorded[0] is asyncio.get_running_loop()
     await bot.stop()
+
+
+# -- controlled-timestamp gift wraps -------------------------------------------
+
+
+async def test_gift_wrap_round_trip_and_ordering():
+    from nostr_sdk import KindStandard
+    from nostrbot_sdk.gift_wrap import make_gift_wrap_async
+
+    sender = Keys.generate()
+    recipient = Keys.generate()
+    rumor = (
+        EventBuilder(Kind.from_std(KindStandard.PRIVATE_DIRECT_MESSAGE), "hello")
+        .tags([Tag.public_key(recipient.public_key())])
+        .finalize_unsigned(sender.public_key())
+    )
+
+    import time as t
+    now = int(t.time())
+    wrap1 = await make_gift_wrap_async(
+        sender, recipient.public_key(), rumor, wrap_created_at=now,
+    )
+    wrap2 = await make_gift_wrap_async(
+        sender, recipient.public_key(), rumor, wrap_created_at=now - 2,
+    )
+    # Descending timestamps: chunk 1 is strictly newer than chunk 2.
+    assert wrap1.created_at().as_secs() == now
+    assert wrap2.created_at().as_secs() == now - 2
+    assert wrap1.kind().as_u16() == 1059
+
+    # Full round trip: the recipient decrypts and recovers the rumor.
+    unwrapped = await UnwrappedGift.from_gift_wrap_async(
+        recipient, wrap1,
+    )
+    assert unwrapped.sender().to_hex() == sender.public_key().to_hex()
+    assert unwrapped.rumor().content() == "hello"
+
+
+async def test_gift_wrap_delegates_to_stock_helper_without_timestamp():
+    from nostr_sdk import KindStandard, Timestamp
+    from nostrbot_sdk.gift_wrap import make_gift_wrap_async
+
+    sender = Keys.generate()
+    recipient = Keys.generate()
+    rumor = (
+        EventBuilder(Kind.from_std(KindStandard.PRIVATE_DIRECT_MESSAGE), "hi")
+        .tags([Tag.public_key(recipient.public_key())])
+        .finalize_unsigned(sender.public_key())
+    )
+    wrap = await make_gift_wrap_async(
+        sender, recipient.public_key(), rumor,
+        extra_tags=[Tag.expiration(Timestamp.from_secs(9999999999))],
+    )
+    assert wrap.kind().as_u16() == 1059
+    tag_values = {
+        tag.to_vec()[0]: (tag.to_vec()[1] if len(tag.to_vec()) > 1 else "")
+        for tag in wrap.tags()
+    }
+    assert tag_values.get("expiration") == "9999999999"

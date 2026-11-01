@@ -39,6 +39,7 @@ from nostrbot_sdk.bot import NostrBot, NostrBotConfig
 from nostrbot_sdk.context import SenderContext
 from nostrbot_sdk.dedup import Dedup
 from nostrbot_sdk.expiration import dm_expiration_tag, expiration_tag
+from nostrbot_sdk.gift_wrap import make_gift_wrap_async
 from nostrbot_sdk.identity import Identity, IdentityResolver
 from nostrbot_sdk.locks import UserLockManager
 from nostrbot_sdk.nip17_support import Nip17Support
@@ -79,6 +80,7 @@ __all__ = [
     "Identity",
     "IdentityResolver",
     "InvoiceWallet",
+    "make_gift_wrap_async",
     "LnurlPayParams",
     "LnurlPayer",
     "LnurlSecurityError",
@@ -102,4 +104,4 @@ __all__ = [
     "validate_zap_receipt",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
