@@ -64,6 +64,7 @@ from nostr_sdk import (
     UnwrappedGift,
     nip04_decrypt,
     nip59_make_gift_wrap_async,
+    uniffi_set_event_loop,
 )
 
 from nostrbot_sdk.context import SenderContext
@@ -595,6 +596,11 @@ class NostrBot:
         #    as "unlimited", the since window caps replay to
         #    gift_wrap_lookback_seconds instead of the relay's full
         #    retention, and the dedup cache absorbs the rest.
+        #    NIP-42: AUTH challenges arrive on Rust relay threads; uniffi
+        #    dispatches the async make_auth_event callback onto the event
+        #    loop recorded here. Refresh on every start so a recreated loop
+        #    is always the one used.
+        uniffi_set_event_loop(asyncio.get_running_loop())
         self._start_time = Timestamp.now()
         bot_pk = self._keys.public_key()
 

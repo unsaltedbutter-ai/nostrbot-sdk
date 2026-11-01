@@ -1124,3 +1124,22 @@ def test_nip42_flag_controls_client_authenticator(monkeypatch):
 
     assert isinstance(builders[0].authenticator_arg, _Nip42Authenticator)
     assert builders[1].authenticator_arg == "sentinel"
+
+
+async def test_start_records_event_loop_for_nip42_callbacks(bot, monkeypatch):
+    """start() refreshes uniffi's global event loop so AUTH challenges that
+    arrive on Rust relay threads can dispatch the async authenticator."""
+    recorded: list[Any] = []
+
+    def _fake_set_event_loop(loop):
+        recorded.append(loop)
+
+    monkeypatch.setattr(
+        "nostrbot_sdk.bot.uniffi_set_event_loop", _fake_set_event_loop,
+    )
+    _stub_lifecycle_client(bot)
+
+    await bot.start()
+    assert len(recorded) == 1
+    assert recorded[0] is asyncio.get_running_loop()
+    await bot.stop()
