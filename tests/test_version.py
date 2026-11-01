@@ -13,4 +13,4 @@ def test_package_version_matches_installed_distribution() -> None:
 
 
 def test_package_version_is_0_6_0() -> None:
-    assert nostrbot_sdk.__version__ == "0.6.0"
+    assert nostrbot_sdk.__version__ == "0.7.0"

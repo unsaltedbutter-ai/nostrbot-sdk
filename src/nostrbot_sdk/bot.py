@@ -44,7 +44,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from nostr_sdk import (
-    Client,
+    Authenticator,
+    ClientBuilder,
     ClientNotification,
     Event,
     EventBuilder,
@@ -97,6 +98,31 @@ DmHandler = Callable[[SenderContext, str], Awaitable[None]]
 ZapHandler = Callable[[ValidatedZap, SenderContext], Awaitable[None]]
 PushHandler = Callable[[str], Awaitable[None]]
 HeartbeatHandler = Callable[[int], Awaitable[None]]
+
+
+class _Nip42Authenticator(Authenticator):
+    """Answers relay NIP-42 AUTH challenges with a signed kind-22242 event.
+
+    Relays that restrict reads to the authenticated recipient -- private DM
+    inboxes -- issue a challenge on connect. This implementation signs the
+    challenge with the bot's own key; relays that never challenge are
+    unaffected (the client simply never authenticates to them).
+    """
+
+    def __init__(self, keys: Keys) -> None:
+        self._keys = keys
+
+    async def make_auth_event(
+        self, relay_url: RelayUrl, challenge: str,
+    ) -> Event | None:
+        return await (
+            EventBuilder(Kind(22242), "")
+            .tags([
+                Tag.parse(["relay", str(relay_url)]),
+                Tag.parse(["challenge", challenge]),
+            ])
+            .finalize_async(self._keys)
+        )
 
 
 @dataclass
@@ -182,6 +208,11 @@ class NostrBotConfig:
     reports the bot unhealthy. None (the default) disables stall detection,
     preserving the pre-0.6.0 behavior."""
 
+    nip42_auth: bool = True
+    """Answer NIP-42 AUTH challenges from relays with a signed kind-22242
+    event. Required for private DM inboxes that serve gift wraps only to the
+    authenticated recipient; a no-op on relays that never challenge."""
+
     gift_wrap_lookback_seconds: int = 49 * 3600
     """Lookback window (`.since`) on the kind-1059 gift-wrap subscription
     filter. NIP-59 randomizes gift-wrap created_at up to 48 hours back, so
@@ -209,7 +240,13 @@ class NostrBot:
         # nostr-sdk >=0.45: Keys implements the signer traits directly and the
         # Client no longer holds a signer -- events are signed before sending.
         self._signer = self._keys
-        self._client = Client()
+        # Relays that challenge (NIP-42) -- private inboxes that serve gift
+        # wraps only to the authenticated recipient -- get a signed kind-22242
+        # auth event from this bot's key. No-op on relays that never challenge.
+        builder = ClientBuilder()
+        if self._config.nip42_auth:
+            builder = builder.authenticator(_Nip42Authenticator(self._keys))
+        self._client = builder.build()
         self._pubkey_hex = self._keys.public_key().to_hex()
 
         self._dedup_event: Dedup[str] = Dedup(

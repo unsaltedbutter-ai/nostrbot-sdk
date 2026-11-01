@@ -1069,3 +1069,58 @@ async def test_heartbeat_loop_invokes_handler_at_intervals(bot) -> None:
         pass
     # Heartbeat shouldn't have fired in 50ms with interval=1s.
     assert calls == []
+
+
+# -- NIP-42 authenticator ------------------------------------------------------
+
+
+async def test_nip42_authenticator_signs_kind_22242():
+    from nostrbot_sdk.bot import _Nip42Authenticator
+
+    auth = _Nip42Authenticator(Keys.generate())
+    event = await auth.make_auth_event(
+        RelayUrl.parse("wss://nip17.example/"), "challenge-123",
+    )
+    assert event is not None
+    assert event.kind().as_u16() == 22242
+    tag_values = {
+        tag.to_vec()[0]: (tag.to_vec()[1] if len(tag.to_vec()) > 1 else "")
+        for tag in event.tags()
+    }
+    assert tag_values.get("relay") == "wss://nip17.example/"
+    assert tag_values.get("challenge") == "challenge-123"
+    assert event.content() == ""
+
+
+def test_nip42_flag_controls_client_authenticator(monkeypatch):
+    from nostrbot_sdk.bot import NostrBot, NostrBotConfig, _Nip42Authenticator
+
+    builders: list[Any] = []
+
+    class _FakeBuilder:
+        def __init__(self):
+            self.authenticator_arg = "sentinel"
+
+        def authenticator(self, authenticator):
+            self.authenticator_arg = authenticator
+            return self
+
+        def build(self):
+            return object()
+
+    def _fake_builder_factory():
+        builder = _FakeBuilder()
+        builders.append(builder)
+        return builder
+
+    monkeypatch.setattr("nostrbot_sdk.bot.ClientBuilder", _fake_builder_factory)
+
+    NostrBot(NostrBotConfig(
+        nsec=_fresh_nsec(), relays=["wss://relay.example/"], nip42_auth=True,
+    ))
+    NostrBot(NostrBotConfig(
+        nsec=_fresh_nsec(), relays=["wss://relay.example/"], nip42_auth=False,
+    ))
+
+    assert isinstance(builders[0].authenticator_arg, _Nip42Authenticator)
+    assert builders[1].authenticator_arg == "sentinel"

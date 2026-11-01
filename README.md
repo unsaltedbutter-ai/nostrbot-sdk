@@ -795,11 +795,42 @@ cfg = NostrBotConfig(
 )
 ```
 
+### Private inboxes (NIP-42 auth) (v0.7.0)
+
+`NostrBotConfig(nip42_auth=True)` (the default) makes the client answer relay
+AUTH challenges with a signed kind-22242 event, so the bot can read from
+private DM inboxes.
+
+**Why it matters.** Private inboxes (a personal relay that serves gift wraps
+only to the authenticated p-tagged recipient) refuse reads until the client
+authenticates. Without an authenticator, a bot subscribing to such a relay
+silently receives nothing — the incident-style failure where the bot looks
+connected but never sees a DM. The authenticator signs the challenge with the
+bot's own key; relays that never challenge are unaffected, and the bot's
+pubkey is public information regardless.
+
+**Usage.**
+
+```python
+cfg = NostrBotConfig(
+    nsec="nsec1...",
+    relays=["wss://nip17.example", "wss://nos.lol"],
+    nip42_auth=True,  # default; set False to never answer challenges
+)
+```
+
 ---
 
 ## Versions
 
-- **v0.6.0** (current) — watchdog hooks and idempotency keys.
+- **v0.7.0** (current) — NIP-42 authentication for private DM inboxes.
+  - **New**: `NostrBotConfig.nip42_auth` (default `True`) — the client answers
+    relay AUTH challenges with a signed kind-22242 event, so bots work against
+    private inboxes that serve gift wraps only to the authenticated
+    recipient. A no-op on relays that never challenge. Set `nip42_auth=False`
+    to restore pre-0.7.0 behavior.
+  - See "Private inboxes (NIP-42 auth)" below for rationale and usage.
+- **v0.6.0** — watchdog hooks and idempotency keys.
   - **Dependency**: `nostr-sdk` pin tightened to `>=0.45.1,<0.46` — stable
     releases only, no alphas. Aligned to the stable API (`Event.tags()` returns
     `list[Tag]`, `Tag.to_vec()` replaces `as_vec()`, and
