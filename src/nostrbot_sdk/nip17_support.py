@@ -134,10 +134,12 @@ class Nip17Support:
             ReqTarget.auto([f]), FETCH_TIMEOUT,
         )
 
-        if events.is_empty():
+        if not events:
             return None
 
-        event = events.first()
+        event = events[0]
+        # nostr-sdk >=0.45 python bindings: fetch_events() -> List[Event];
+        # tags() -> List[Tag] where Tag.to_vec() -> List[str].
         relay_urls: list[str] = []
         for tag in event.tags():
             tag_vec = tag.to_vec()

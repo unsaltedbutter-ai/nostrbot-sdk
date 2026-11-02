@@ -108,9 +108,9 @@ class IdentityResolver:
         events = await self._client.fetch_events(
             ReqTarget.auto([f]), self._fetch_timeout,
         )
-        if events.is_empty():
+        if not events:
             return Identity(pubkey_hex=pubkey_hex)
-        data = json.loads(events.first().content())
+        data = json.loads(events[0].content())
         return Identity(
             pubkey_hex=pubkey_hex,
             name=_clean(data.get("name")),

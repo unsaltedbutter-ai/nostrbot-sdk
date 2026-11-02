@@ -13,19 +13,14 @@ from nostrbot_sdk.nip17_support import Nip17Support
 
 
 def _make_events_result(events_list: list | None = None):
-    """Build a mock Events result from client.fetch_events.
+    """Build a mock client.fetch_events() return value.
 
-    If events_list is None, returns an empty result (is_empty() == True).
-    If events_list is provided, returns a result where first() is events_list[0].
+    nostr-sdk >=0.45.1 returns a plain List[Event]; an empty fetch is an
+    empty (falsy) list.
     """
-    result = MagicMock()
-    if events_list is None or len(events_list) == 0:
-        result.is_empty.return_value = True
-        result.first.return_value = None
-    else:
-        result.is_empty.return_value = False
-        result.first.return_value = events_list[0]
-    return result
+    if events_list is None:
+        return []
+    return events_list
 
 
 def _make_event_with_relay_tags(relay_urls: list[str]):

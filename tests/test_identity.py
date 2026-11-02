@@ -12,21 +12,14 @@ PUBKEY = "aa" * 32
 OTHER = "bb" * 32
 
 
-def _events_mock(data: dict | None) -> MagicMock:
-    """Fake nostr_sdk.Events: empty when data is None, else one kind 0 event.
-
-    Must be a MagicMock (not AsyncMock): is_empty/first/content are sync.
-    """
-    events = MagicMock()
+def _events_mock(data: dict | None) -> list:
+    """Fake nostr_sdk fetch_events() result: [] when data is None, else one
+    kind 0 event (nostr-sdk >=0.45.1 returns a plain List[Event])."""
     if data is None:
-        events.is_empty.return_value = True
-        events.first.return_value = None
-        return events
-    events.is_empty.return_value = False
+        return []
     event = MagicMock()
     event.content.return_value = json.dumps(data)
-    events.first.return_value = event
-    return events
+    return [event]
 
 
 async def test_returns_full_identity_on_kind_0_hit() -> None:
